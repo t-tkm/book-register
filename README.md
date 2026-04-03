@@ -2,6 +2,14 @@
 
 ISBNを入力すると、[OpenBD](https://openbd.jp/) から書誌情報を取得してNotionデータベースに自動登録するCLIツール。
 
+公開用に最低限の構成を整えたリポジトリです。ローカルの `.env` はコミットせず、`.env.example` を雛形として使ってください。
+
+## 必要環境
+
+- Rust 1.94.1 以上
+- Notion integration と登録先データベース
+- OpenBD にアクセスできるネットワーク環境
+
 ## セットアップ
 
 ### 1. 環境変数の設定
@@ -14,6 +22,12 @@ cp .env.example .env
 
 - **NOTION_API_KEY**: [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
 - **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
+
+公開リポジトリで運用する場合:
+
+- `.env` はコミットしない
+- キーを画面共有や CI ログに出さない
+- もし漏えいした可能性があれば Notion integration token を再発行する
 
 ### 2. Notionデータベースの構成
 
@@ -93,8 +107,30 @@ Notion API  https://api.notion.com/v1/pages
 cargo build --release
 ```
 
+### 実行
+
+```sh
+cargo run -- 9784478039670
+```
+
 ### テスト
 
 ```sh
 cargo test
 ```
+
+### GitHub Actions
+
+- `CI`: `main` / `master` への push と Pull Request で `cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test` を実行
+- `Release`: `v*` タグ push で Linux/macOS/Windows 向けバイナリをビルドし、GitHub Release にアーカイブを添付
+
+リリース例:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## ライセンス
+
+MIT License

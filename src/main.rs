@@ -1,7 +1,7 @@
 use std::{path::Path, process, time::Duration};
 
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use clap::Parser;
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -45,10 +45,14 @@ impl Config {
     fn from_env(dry_run: bool) -> Result<Self, String> {
         if dry_run {
             return Ok(Self {
-                notion_api_key: std::env::var("NOTION_API_KEY").unwrap_or_default().trim().to_string(),
-                notion_database_id: std::env::var("NOTION_DATABASE_ID").unwrap_or_else(|_| {
-                    "00000000-0000-0000-0000-000000000000".to_string()
-                }).trim().to_string(),
+                notion_api_key: std::env::var("NOTION_API_KEY")
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                notion_database_id: std::env::var("NOTION_DATABASE_ID")
+                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string())
+                    .trim()
+                    .to_string(),
             });
         }
         let api_key = std::env::var("NOTION_API_KEY")
@@ -83,16 +87,60 @@ struct Book {
 // ============================================================
 
 fn normalize_isbn(raw: &str) -> Option<String> {
-    let cleaned: String = raw.trim().chars().filter(|c| !matches!(c, '-' | ' ')).collect();
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' '))
+        .collect();
     match cleaned.len() {
-        13 if cleaned.chars().all(|c| c.is_ascii_digit()) => Some(cleaned),
+        13 if cleaned.chars().all(|c| c.is_ascii_digit()) && is_valid_isbn13(&cleaned) => {
+            Some(cleaned)
+        }
         10 if cleaned[..9].chars().all(|c| c.is_ascii_digit())
-            && cleaned.chars().last().map_or(false, |c| c.is_ascii_digit() || matches!(c, 'X' | 'x')) =>
+            && cleaned
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_ascii_digit() || matches!(c, 'X' | 'x'))
+            && is_valid_isbn10(&cleaned) =>
         {
             Some(isbn10_to_isbn13(&cleaned))
         }
         _ => None,
     }
+}
+
+fn is_valid_isbn10(isbn10: &str) -> bool {
+    if isbn10.len() != 10 {
+        return false;
+    }
+
+    let mut total = 0u32;
+    for (i, c) in isbn10.chars().enumerate() {
+        let digit = match c {
+            '0'..='9' => c.to_digit(10).unwrap(),
+            'X' | 'x' if i == 9 => 10,
+            _ => return false,
+        };
+        total += digit * (10 - i as u32);
+    }
+
+    total.is_multiple_of(11)
+}
+
+fn is_valid_isbn13(isbn13: &str) -> bool {
+    if isbn13.len() != 13 || !isbn13.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    let total: u32 = isbn13
+        .chars()
+        .take(12)
+        .enumerate()
+        .map(|(i, c)| c.to_digit(10).unwrap() * if i % 2 == 0 { 1 } else { 3 })
+        .sum();
+    let check = (10 - total % 10) % 10;
+
+    isbn13.chars().last().and_then(|c| c.to_digit(10)) == Some(check)
 }
 
 fn isbn10_to_isbn13(isbn10: &str) -> String {
@@ -117,7 +165,11 @@ fn isbn13_to_isbn10(isbn13: &str) -> Option<String> {
         .map(|(i, c)| c.to_digit(10).unwrap() * (10 - i as u32))
         .sum();
     let check = (11 - total % 11) % 11;
-    let check_char = if check == 10 { "X".to_string() } else { check.to_string() };
+    let check_char = if check == 10 {
+        "X".to_string()
+    } else {
+        check.to_string()
+    };
     Some(format!("{base}{check_char}"))
 }
 
@@ -146,11 +198,11 @@ fn parse_openbd(data: &Value) -> Option<Book> {
 
     Some(Book {
         title,
-        author:      summary["author"].as_str().unwrap_or("").to_string(),
-        pubdate:     format_date(summary["pubdate"].as_str().unwrap_or("")),
-        cover:       summary["cover"].as_str().unwrap_or("").to_string(),
-        isbn:        summary["isbn"].as_str().unwrap_or("").to_string(),
-        price:       extract_price(onix),
+        author: summary["author"].as_str().unwrap_or("").to_string(),
+        pubdate: format_date(summary["pubdate"].as_str().unwrap_or("")),
+        cover: summary["cover"].as_str().unwrap_or("").to_string(),
+        isbn: summary["isbn"].as_str().unwrap_or("").to_string(),
+        price: extract_price(onix),
         description: extract_description(onix),
     })
 }
@@ -170,9 +222,8 @@ fn extract_price(onix: &Value) -> Option<u32> {
         Value::Object(_) => vec![prices],
         _ => return None,
     };
-    list.iter().find_map(|p| {
-        p["PriceAmount"].as_str()?.parse::<u32>().ok()
-    })
+    list.iter()
+        .find_map(|p| p["PriceAmount"].as_str()?.parse::<u32>().ok())
 }
 
 fn extract_description(onix: &Value) -> String {
@@ -186,7 +237,9 @@ fn extract_description(onix: &Value) -> String {
     list.iter()
         .find_map(|t| {
             let text = t["Text"].as_str()?;
-            if text.is_empty() { return None; }
+            if text.is_empty() {
+                return None;
+            }
             let clean = html_tag.replace_all(text, "").trim().to_string();
             Some(clean.chars().take(2000).collect())
         })
@@ -199,19 +252,32 @@ fn extract_description(onix: &Value) -> String {
 
 fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> Value {
     let mut props = Map::new();
-    props.insert("名前".into(),   json!({"title": [{"text": {"content": book.title}}]}));
+    props.insert(
+        "名前".into(),
+        json!({"title": [{"text": {"content": book.title}}]}),
+    );
     props.insert("購入年月".into(), json!({"date": {"start": purchase_date}}));
 
-    for (key, value) in [("代表著者", &book.author), ("発売日", &book.pubdate), ("概要", &book.description)] {
+    for (key, value) in [
+        ("代表著者", &book.author),
+        ("発売日", &book.pubdate),
+        ("概要", &book.description),
+    ] {
         if !value.is_empty() {
-            props.insert(key.into(), json!({"rich_text": [{"text": {"content": value}}]}));
+            props.insert(
+                key.into(),
+                json!({"rich_text": [{"text": {"content": value}}]}),
+            );
         }
     }
     if let Some(price) = book.price {
         props.insert("価格".into(), json!({"number": price}));
     }
     if let Some(isbn10) = isbn13_to_isbn10(&book.isbn) {
-        props.insert("AmazonURL".into(), json!({"url": format!("https://www.amazon.co.jp/dp/{isbn10}/")}));
+        props.insert(
+            "AmazonURL".into(),
+            json!({"url": format!("https://www.amazon.co.jp/dp/{isbn10}/")}),
+        );
     }
     if !book.cover.is_empty() {
         props.insert("画像".into(), json!({"url": book.cover}));
@@ -242,7 +308,12 @@ async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Con
 // Main processing
 // ============================================================
 
-async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &str, dry_run: bool) {
+async fn process_isbns(
+    isbn_list: Vec<String>,
+    config: &Config,
+    purchase_date: &str,
+    dry_run: bool,
+) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -291,7 +362,11 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
             }
             if !book.description.is_empty() {
                 let preview: String = book.description.chars().take(400).collect();
-                let ellipsis = if book.description.chars().count() > 400 { "…" } else { "" };
+                let ellipsis = if book.description.chars().count() > 400 {
+                    "…"
+                } else {
+                    ""
+                };
                 println!("     概要: {preview}{ellipsis}");
             } else {
                 println!("     概要: （データなし・手動入力用）");
@@ -324,10 +399,35 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
 
     println!("\n{}", "=".repeat(60));
     if dry_run {
-        println!("📊 結果（ドライラン）: 取得表示={success}  スキップ={skip}  失敗={fail}  合計={total}");
+        println!(
+            "📊 結果（ドライラン）: 取得表示={success}  スキップ={skip}  失敗={fail}  合計={total}"
+        );
     } else {
         println!("📊 結果: 成功={success}  スキップ={skip}  失敗={fail}  合計={total}");
     }
+}
+
+fn validate_purchase_date(raw: &str) -> Result<(), String> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|_| "❌ --date は YYYY-MM-DD 形式の実在する日付を指定してください".to_string())
+}
+
+fn mask_secret(value: &str) -> String {
+    if value.is_empty() {
+        return "(未設定)".to_string();
+    }
+
+    let visible = value.chars().count().min(4);
+    let suffix: String = value
+        .chars()
+        .rev()
+        .take(visible)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("***{suffix}")
 }
 
 #[tokio::main]
@@ -363,10 +463,19 @@ async fn main() {
 
     let config = match Config::from_env(cli.dry_run) {
         Ok(c) => c,
-        Err(e) => { eprintln!("{e}"); process::exit(1); }
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
     };
 
-    let purchase_date = cli.date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let purchase_date = cli
+        .date
+        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    if let Err(e) = validate_purchase_date(&purchase_date) {
+        eprintln!("{e}");
+        process::exit(1);
+    }
 
     println!("書籍DB登録ツール");
     if cli.dry_run {
@@ -374,12 +483,11 @@ async fn main() {
         if config.notion_api_key.is_empty() {
             println!("   NOTION_API_KEY: （未設定・ペイロード表示用に省略可）");
         } else {
-            let n = config.notion_api_key.len().min(20);
-            println!("   NOTION_API_KEY: {}...", &config.notion_api_key[..n]);
+            println!("   NOTION_API_KEY: {}", mask_secret(&config.notion_api_key));
         }
         println!(
             "   NOTION_DATABASE_ID: {}{}",
-            config.notion_database_id,
+            mask_secret(&config.notion_database_id),
             if std::env::var("NOTION_DATABASE_ID").is_err() {
                 "（未設定時はダミーIDで JSON を生成）"
             } else {
@@ -387,9 +495,11 @@ async fn main() {
             }
         );
     } else {
-        let n = config.notion_api_key.len().min(20);
-        println!("   API Key: {}...", &config.notion_api_key[..n]);
-        println!("   Database ID: {}", config.notion_database_id);
+        println!("   API Key: {}", mask_secret(&config.notion_api_key));
+        println!(
+            "   Database ID: {}",
+            mask_secret(&config.notion_database_id)
+        );
     }
     println!("   購入年月日: {purchase_date}");
 
@@ -406,12 +516,21 @@ mod tests {
 
     #[test]
     fn normalize_isbn13_digits_only() {
-        assert_eq!(normalize_isbn("9784478039670"), Some("9784478039670".into()));
+        assert_eq!(
+            normalize_isbn("9784478039670"),
+            Some("9784478039670".into())
+        );
     }
 
     #[test]
     fn normalize_isbn10_converts_to_isbn13() {
         assert_eq!(normalize_isbn("4478039674"), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn_rejects_invalid_check_digit() {
+        assert_eq!(normalize_isbn("9784478039671"), None);
+        assert_eq!(normalize_isbn("4478039675"), None);
     }
 
     #[test]
@@ -428,5 +547,15 @@ mod tests {
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    #[test]
+    fn validate_purchase_date_accepts_real_date() {
+        assert!(validate_purchase_date("2026-03-15").is_ok());
+    }
+
+    #[test]
+    fn validate_purchase_date_rejects_invalid_date() {
+        assert!(validate_purchase_date("2026-02-30").is_err());
     }
 }
