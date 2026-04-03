@@ -288,11 +288,6 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let config = match Config::from_env() {
-        Ok(c) => c,
-        Err(e) => { eprintln!("{e}"); process::exit(1); }
-    };
-
     let mut isbn_list = Vec::new();
 
     if let Some(file_path) = &cli.file {
@@ -315,9 +310,13 @@ async fn main() {
     if isbn_list.is_empty() {
         use clap::CommandFactory;
         Cli::command().print_help().unwrap();
-        eprintln!("\n❌ ISBNが指定されていません");
-        process::exit(1);
+        process::exit(0);
     }
+
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => { eprintln!("{e}"); process::exit(1); }
+    };
 
     let purchase_date = cli.date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
 
