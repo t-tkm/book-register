@@ -329,3 +329,164 @@ async fn main() {
     process_isbns(isbn_list, &config, &purchase_date).await;
 }
 
+// ============================================================
+// Tests
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- normalize_isbn ---
+
+    #[test]
+    fn normalize_isbn13_digits_only() {
+        assert_eq!(normalize_isbn("9784478039670"), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn13_with_hyphens() {
+        assert_eq!(normalize_isbn("978-4-47-803967-0"), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn13_with_spaces() {
+        assert_eq!(normalize_isbn("  9784478039670  "), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn10_converts_to_isbn13() {
+        assert_eq!(normalize_isbn("4478039674"), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn10_with_hyphens() {
+        assert_eq!(normalize_isbn("4-478-03967-4"), Some("9784478039670".into()));
+    }
+
+    #[test]
+    fn normalize_isbn10_x_check_digit() {
+        // ISBN-10 "080442957X" → ISBN-13 "9780804429573"
+        assert_eq!(normalize_isbn("080442957X"), Some("9780804429573".into()));
+        assert_eq!(normalize_isbn("080442957x"), Some("9780804429573".into()));
+    }
+
+    #[test]
+    fn normalize_isbn_invalid_returns_none() {
+        assert_eq!(normalize_isbn("123"), None);
+        assert_eq!(normalize_isbn("abcdefghijk"), None);
+        assert_eq!(normalize_isbn(""), None);
+        assert_eq!(normalize_isbn("12345678901234"), None); // 14桁
+    }
+
+    // --- isbn10_to_isbn13 / isbn13_to_isbn10 ---
+
+    #[test]
+    fn isbn10_to_isbn13_roundtrip() {
+        let isbn10 = "4478039674";
+        let isbn13 = isbn10_to_isbn13(isbn10);
+        assert_eq!(isbn13, "9784478039670");
+        assert_eq!(isbn13_to_isbn10(&isbn13).unwrap(), isbn10);
+    }
+
+    #[test]
+    fn isbn13_to_isbn10_x_check_digit() {
+        assert_eq!(isbn13_to_isbn10("9780804429573").unwrap(), "080442957X");
+    }
+
+    #[test]
+    fn isbn13_to_isbn10_non_978_returns_none() {
+        assert_eq!(isbn13_to_isbn10("9794478039670"), None);
+    }
+
+    #[test]
+    fn isbn13_to_isbn10_wrong_length_returns_none() {
+        assert_eq!(isbn13_to_isbn10("978447803967"), None);
+    }
+
+    // --- format_date ---
+
+    #[test]
+    fn format_date_8_digits() {
+        assert_eq!(format_date("20231213"), "2023-12-13");
+    }
+
+    #[test]
+    fn format_date_6_digits_unchanged() {
+        assert_eq!(format_date("202312"), "202312");
+    }
+
+    #[test]
+    fn format_date_empty_unchanged() {
+        assert_eq!(format_date(""), "");
+    }
+
+    // --- extract_price ---
+
+    #[test]
+    fn extract_price_single_object() {
+        let onix = json!({
+            "ProductSupply": { "SupplyDetail": { "Price": {"PriceAmount": "3200"} } }
+        });
+        assert_eq!(extract_price(&onix), Some(3200));
+    }
+
+    #[test]
+    fn extract_price_array_returns_first() {
+        let onix = json!({
+            "ProductSupply": { "SupplyDetail": { "Price": [
+                {"PriceAmount": "2800"},
+                {"PriceAmount": "3080"}
+            ]}}
+        });
+        assert_eq!(extract_price(&onix), Some(2800));
+    }
+
+    #[test]
+    fn extract_price_missing_returns_none() {
+        assert_eq!(extract_price(&json!({})), None);
+    }
+
+    // --- extract_description ---
+
+    #[test]
+    fn extract_description_single_object() {
+        let onix = json!({
+            "CollateralDetail": { "TextContent": {"Text": "本の紹介文です。"} }
+        });
+        assert_eq!(extract_description(&onix), "本の紹介文です。");
+    }
+
+    #[test]
+    fn extract_description_strips_html_tags() {
+        let onix = json!({
+            "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
+        });
+        assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    #[test]
+    fn extract_description_array_skips_empty() {
+        let onix = json!({
+            "CollateralDetail": { "TextContent": [
+                {"Text": ""},
+                {"Text": "2番目のテキスト"}
+            ]}
+        });
+        assert_eq!(extract_description(&onix), "2番目のテキスト");
+    }
+
+    #[test]
+    fn extract_description_missing_returns_empty() {
+        assert_eq!(extract_description(&json!({})), "");
+    }
+
+    #[test]
+    fn extract_description_truncates_at_2000_chars() {
+        let long_text = "あ".repeat(3000);
+        let onix = json!({
+            "CollateralDetail": { "TextContent": {"Text": long_text} }
+        });
+        assert_eq!(extract_description(&onix).chars().count(), 2000);
+    }
+}
