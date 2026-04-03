@@ -154,6 +154,19 @@ fn isbn10_to_isbn13(isbn10: &str) -> String {
     format!("{base}{check}")
 }
 
+fn get_book_cover_url(isbn13: &str, openbd_cover: &str) -> String {
+    if !openbd_cover.is_empty() {
+        return openbd_cover.to_string();
+    }
+    
+    // OpenBDに画像がない場合、Amazon商品画像を使用
+    if let Some(isbn10) = isbn13_to_isbn10(isbn13) {
+        format!("https://images-na.ssl-images-amazon.com/images/P/{}.01.L.jpg", isbn10)
+    } else {
+        String::new()
+    }
+}
+
 fn isbn13_to_isbn10(isbn13: &str) -> Option<String> {
     if isbn13.len() != 13 || !isbn13.starts_with("978") {
         return None;
@@ -200,7 +213,7 @@ fn parse_openbd(data: &Value) -> Option<Book> {
         title,
         author: summary["author"].as_str().unwrap_or("").to_string(),
         pubdate: format_date(summary["pubdate"].as_str().unwrap_or("")),
-        cover: summary["cover"].as_str().unwrap_or("").to_string(),
+        cover: get_book_cover_url(summary["isbn"].as_str().unwrap_or(""), summary["cover"].as_str().unwrap_or("")),
         isbn: summary["isbn"].as_str().unwrap_or("").to_string(),
         price: extract_price(onix),
         description: extract_description(onix),
@@ -210,6 +223,8 @@ fn parse_openbd(data: &Value) -> Option<Book> {
 fn format_date(raw: &str) -> String {
     if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_digit()) {
         format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8])
+    } else if raw.len() == 6 && raw.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-01", &raw[..4], &raw[4..6])
     } else {
         raw.to_string()
     }
@@ -280,7 +295,12 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
         );
     }
     if !book.cover.is_empty() {
-        props.insert("画像".into(), json!({"url": book.cover}));
+        props.insert("画像".into(), json!({
+            "files": [{
+                "name": "cover.jpg",
+                "external": {"url": book.cover}
+            }]
+        }));
     }
 
     json!({ "parent": {"database_id": database_id}, "properties": props })
