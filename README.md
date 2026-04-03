@@ -18,12 +18,24 @@ cargo build --release
 
 ### 2. 環境変数の設定
 
-プロジェクトルートに `.env` を作成する。
+`.env.example` をコピーして `.env` を作成し、値を入力する。
+
+```sh
+cp .env.example .env
+```
 
 ```
-NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxx
+# Notion API キー
+# 取得先: https://www.notion.so/my-integrations
+NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Notion データベース ID
+# データベースURLの末尾32文字: https://www.notion.so/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
 NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
+
+- **NOTION_API_KEY**: Notion の [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
+- **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
 
 ### 3. Notionデータベースの構成
 
