@@ -35,6 +35,7 @@ struct Cli {
 struct Config {
     notion_api_key: String,
     notion_database_id: String,
+    rakuten_app_id: Option<String>,
 }
 
 impl Config {
@@ -43,7 +44,8 @@ impl Config {
             .map_err(|_| "❌ .env に NOTION_API_KEY を設定してください".to_string())?;
         let database_id = std::env::var("NOTION_DATABASE_ID")
             .map_err(|_| "❌ .env に NOTION_DATABASE_ID を設定してください".to_string())?;
-        Ok(Self { notion_api_key: api_key, notion_database_id: database_id })
+        let rakuten_app_id = std::env::var("RAKUTEN_APP_ID").ok();
+        Ok(Self { notion_api_key: api_key, notion_database_id: database_id, rakuten_app_id })
     }
 }
 
@@ -177,6 +179,23 @@ fn extract_description(onix: &Value) -> String {
 }
 
 // ============================================================
+// 楽天ブックスAPI（概要フォールバック）
+// ============================================================
+
+async fn fetch_description_rakuten(client: &reqwest::Client, isbn13: &str, app_id: &str) -> Option<String> {
+    let url = format!(
+        "https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404\
+         ?format=json&isbn={isbn13}&applicationId={app_id}"
+    );
+    let data: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+    let caption = data["Items"][0]["Item"]["itemCaption"].as_str()?;
+    if caption.is_empty() {
+        return None;
+    }
+    Some(caption.chars().take(2000).collect())
+}
+
+// ============================================================
 // Notion
 // ============================================================
 
@@ -247,11 +266,19 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
             continue;
         };
 
-        let Some(book) = fetch_book(&client, &isbn13).await else {
+        let Some(mut book) = fetch_book(&client, &isbn13).await else {
             println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
             skip += 1;
             continue;
         };
+
+        if book.description.is_empty() {
+            if let Some(app_id) = &config.rakuten_app_id {
+                if let Some(desc) = fetch_description_rakuten(&client, &isbn13, app_id).await {
+                    book.description = desc;
+                }
+            }
+        }
 
         println!("  📗 {}", book.title);
         println!("     著者: {}", book.author);

@@ -14,6 +14,7 @@ cp .env.example .env
 
 - **NOTION_API_KEY**: [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
 - **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
+- **RAKUTEN_APP_ID**（省略可）: [楽天デベロッパー](https://webservice.rakuten.co.jp/) で発行されるアプリID。設定すると OpenBD に概要がない場合に楽天ブックスAPIからフォールバック取得する。
 
 ### 2. Notionデータベースの構成
 
@@ -116,7 +117,7 @@ Notion データベース
 | 名前            | タイトル  | `summary.title`                                     |
 | 代表著者        | テキスト  | `summary.author`                                    |
 | 発売日          | テキスト  | `summary.pubdate`（`YYYYMMDD` → `YYYY-MM-DD` に変換）|
-| 概要            | テキスト  | `onix.CollateralDetail.TextContent[].Text`（HTMLタグ除去・2000文字上限）|
+| 概要            | テキスト  | `onix.CollateralDetail.TextContent[].Text`（HTMLタグ除去・2000文字上限）<br>空の場合は楽天ブックスAPI `itemCaption` にフォールバック（`RAKUTEN_APP_ID` 設定時のみ）|
 | 購入年月        | 日付     | 実行日（`--date` オプションで上書き可）               |
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
