@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 #[derive(Parser)]
 #[command(
     about = "ISBN → OpenBD → Notion 書籍DB登録",
-    after_help = "例: book_register 9784478039670"
+    after_help = "例: book_register 9784478039670 9784798067278"
 )]
 struct Cli {
     /// ISBN-10 または ISBN-13（複数指定可）
