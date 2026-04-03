@@ -2,21 +2,9 @@
 
 ISBNを入力すると、[OpenBD](https://openbd.jp/) から書誌情報を取得してNotionデータベースに自動登録するCLIツール。
 
-## 必要なもの
-
-- Rust 1.70以上
-- Notion APIキー
-- Notion データベースID
-
 ## セットアップ
 
-### 1. ビルド
-
-```sh
-cargo build --release
-```
-
-### 2. 環境変数の設定
+### 1. 環境変数の設定
 
 `.env.example` をコピーして `.env` を作成し、値を入力する。
 
@@ -24,43 +12,35 @@ cargo build --release
 cp .env.example .env
 ```
 
-```
-# Notion API キー
-# 取得先: https://www.notion.so/my-integrations
-NOTION_API_KEY=secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Notion データベース ID
-# データベースURLの末尾32文字: https://www.notion.so/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx?v=...
-NOTION_DATABASE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-- **NOTION_API_KEY**: Notion の [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
+- **NOTION_API_KEY**: [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
 - **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
 
-### 3. Notionデータベースの構成
+### 2. Notionデータベースの構成
 
 以下のプロパティを持つデータベースを用意する。
 
-| プロパティ名 | 型         |
-|------------|-----------|
-| 名前        | タイトル    |
-| 代表著者    | テキスト    |
-| 発売日      | テキスト    |
-| 概要        | テキスト    |
-| 購入年月    | 日付       |
-| 価格        | 数値       |
-| AmazonURL  | URL        |
-| 画像        | URL        |
+| プロパティ名 | 型       |
+|------------|---------|
+| 名前        | タイトル  |
+| 代表著者    | テキスト  |
+| 発売日      | テキスト  |
+| 概要        | テキスト  |
+| 購入年月    | 日付     |
+| 価格        | 数値     |
+| AmazonURL  | URL      |
+| 画像        | URL      |
 
 ## 使い方
 
 ```sh
 # ISBNを直接指定（複数可）
-./target/release/book_register 9784478039670
-./target/release/book_register 9784478039670 9784798067278
+book_register 9784478039670 9784798067278
+
+# 購入日を指定（省略時は今日）
+book_register -d 2026-03-15 9784478039670
 
 # ISBNリストファイルを指定
-./target/release/book_register -f isbn_list.txt
+book_register -f isbn_list.txt
 ```
 
 ISBNリストファイルは1行1ISBN。`#` で始まる行はコメントとして無視される。
@@ -72,12 +52,15 @@ ISBNリストファイルは1行1ISBN。`#` で始まる行はコメントとし
 4873119464          # ISBN-10も可
 ```
 
+対応形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
+
 ## 実行例
 
 ```
 書籍DB登録ツール
    API Key: secret_xxxxxxxxxxxx...
    Database ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   購入年月日: 2026-04-03
 
 📚 2件のISBNを処理します
 
@@ -101,11 +84,20 @@ ISBNリストファイルは1行1ISBN。`#` で始まる行はコメントとし
 📊 結果: 成功=2  スキップ=0  失敗=0  合計=2
 ```
 
-## 対応ISBN形式
+---
 
-- ISBN-13（数字13桁）: `9784478039670`
-- ISBN-13（ハイフン付き）: `978-4-47-803967-0`
-- ISBN-10: `4478039674`
-- ISBN-10（ハイフン付き）: `4-47-803967-4`
+## 開発
 
-ISBN-10は内部でISBN-13に変換して処理する。
+### ビルド
+
+```sh
+cargo build --release
+```
+
+Rust 1.70 以上が必要。
+
+### テスト
+
+```sh
+cargo test
+```
