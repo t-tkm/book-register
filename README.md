@@ -14,7 +14,6 @@ cp .env.example .env
 
 - **NOTION_API_KEY**: [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
 - **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
-- **RAKUTEN_APP_ID**（省略可）: [楽天デベロッパー](https://webservice.rakuten.co.jp/) で発行されるアプリID。設定すると OpenBD に概要がない場合に楽天ブックスAPIからフォールバック取得する。
 
 ### 2. Notionデータベースの構成
 
@@ -42,54 +41,18 @@ book_register -d 2026-03-15 9784478039670
 
 # ISBNリストファイルを指定
 book_register -f isbn_list.txt
+
+# ドライラン（Notion には送らず、取得結果と送信予定 JSON を標準出力のみ）
+book_register --dry-run 9784478039670
 ```
 
 ISBNリストファイルは1行1ISBN。`#` で始まる行はコメントとして無視される。
 
-```
-# 2024年購入分
-9784478039670
-978-4-7980-6727-8   # ハイフン付きも可
-4873119464          # ISBN-10も可
-```
-
 対応形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
-
-## 実行例
-
-```
-書籍DB登録ツール
-   API Key: secret_xxxxxxxxxxxx...
-   Database ID: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-   購入年月日: 2026-04-03
-
-📚 2件のISBNを処理します
-
-============================================================
-
-[1/2] 9784478039670
-  📗 ゼロから作るDeep Learning
-     著者: 斎藤,康毅
-     定価: ￥3200（税抜）
-     発売: 2016-09-24
-  ✅ Notion登録完了
-
-[2/2] 9784798067278
-  📗 Python実践データ分析100本ノック
-     著者: 下山,輝昌 松田,雄馬 三木,孝行
-     定価: ￥2400（税抜）
-     発売: 2022-06-09
-  ✅ Notion登録完了
-
-============================================================
-📊 結果: 成功=2  スキップ=0  失敗=0  合計=2
-```
 
 ---
 
-## 付録
-
-### アーキテクチャ
+## アーキテクチャ
 
 ```
 入力 (ISBN)
@@ -105,9 +68,6 @@ OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
     ▼
 Notion API  https://api.notion.com/v1/pages
   取得した書誌情報をページとして挿入
-    │
-    ▼
-Notion データベース
 ```
 
 ### フィールドマッピング
@@ -117,20 +77,11 @@ Notion データベース
 | 名前            | タイトル  | `summary.title`                                     |
 | 代表著者        | テキスト  | `summary.author`                                    |
 | 発売日          | テキスト  | `summary.pubdate`（`YYYYMMDD` → `YYYY-MM-DD` に変換）|
-| 概要            | テキスト  | `onix.CollateralDetail.TextContent[].Text`（HTMLタグ除去・2000文字上限）<br>空の場合は楽天ブックスAPI `itemCaption` にフォールバック（`RAKUTEN_APP_ID` 設定時のみ）|
+| 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合はNotionで手動入力） |
 | 購入年月        | 日付     | 実行日（`--date` オプションで上書き可）               |
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | URL      | `summary.cover`                                     |
-| ジャンル        | —        | N/A（手動入力）                                      |
-| メモ            | —        | N/A（手動入力）                                      |
-
-### 利用サービス
-
-| サービス | 用途 | 認証 |
-|---------|------|------|
-| [OpenBD](https://openbd.jp/) | 書誌情報取得 | 不要 |
-| [Notion API](https://developers.notion.com/) | データベース挿入 | `NOTION_API_KEY` |
 
 ---
 
@@ -141,8 +92,6 @@ Notion データベース
 ```sh
 cargo build --release
 ```
-
-Rust 1.70 以上が必要。
 
 ### テスト
 

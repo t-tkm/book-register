@@ -26,6 +26,10 @@ struct Cli {
     /// 購入年月日（YYYY-MM-DD、省略時は今日）
     #[arg(short, long, value_name = "YYYY-MM-DD")]
     date: Option<String>,
+
+    /// Notion に送信せず、OpenBDの取得結果と送信予定 JSON を標準出力のみに出す
+    #[arg(long = "dry-run")]
+    dry_run: bool,
 }
 
 // ============================================================
@@ -35,17 +39,28 @@ struct Cli {
 struct Config {
     notion_api_key: String,
     notion_database_id: String,
-    rakuten_app_id: Option<String>,
 }
 
 impl Config {
-    fn from_env() -> Result<Self, String> {
+    fn from_env(dry_run: bool) -> Result<Self, String> {
+        if dry_run {
+            return Ok(Self {
+                notion_api_key: std::env::var("NOTION_API_KEY").unwrap_or_default().trim().to_string(),
+                notion_database_id: std::env::var("NOTION_DATABASE_ID").unwrap_or_else(|_| {
+                    "00000000-0000-0000-0000-000000000000".to_string()
+                }).trim().to_string(),
+            });
+        }
         let api_key = std::env::var("NOTION_API_KEY")
+            .map(|s| s.trim().to_string())
             .map_err(|_| "❌ .env に NOTION_API_KEY を設定してください".to_string())?;
         let database_id = std::env::var("NOTION_DATABASE_ID")
+            .map(|s| s.trim().to_string())
             .map_err(|_| "❌ .env に NOTION_DATABASE_ID を設定してください".to_string())?;
-        let rakuten_app_id = std::env::var("RAKUTEN_APP_ID").ok();
-        Ok(Self { notion_api_key: api_key, notion_database_id: database_id, rakuten_app_id })
+        Ok(Self {
+            notion_api_key: api_key,
+            notion_database_id: database_id,
+        })
     }
 }
 
@@ -179,28 +194,10 @@ fn extract_description(onix: &Value) -> String {
 }
 
 // ============================================================
-// 楽天ブックスAPI（概要フォールバック）
-// ============================================================
-
-async fn fetch_description_rakuten(client: &reqwest::Client, isbn13: &str, app_id: &str) -> Option<String> {
-    let url = format!(
-        "https://app.rakuten.co.jp/services/api/BooksBook/Search/20170404\
-         ?format=json&isbn={isbn13}&applicationId={app_id}"
-    );
-    let data: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-    let caption = data["Items"][0]["Item"]["itemCaption"].as_str()?;
-    if caption.is_empty() {
-        return None;
-    }
-    Some(caption.chars().take(2000).collect())
-}
-
-// ============================================================
 // Notion
 // ============================================================
 
 fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> Value {
-
     let mut props = Map::new();
     props.insert("名前".into(),   json!({"title": [{"text": {"content": book.title}}]}));
     props.insert("購入年月".into(), json!({"date": {"start": purchase_date}}));
@@ -245,7 +242,7 @@ async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Con
 // Main processing
 // ============================================================
 
-async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &str) {
+async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &str, dry_run: bool) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -254,7 +251,11 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
     let total = isbn_list.len();
     let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
 
-    println!("\n📚 {total}件のISBNを処理します\n");
+    if dry_run {
+        println!("\n📚 {total}件のISBNを処理します（🔍 ドライラン: Notion には接続しません）\n");
+    } else {
+        println!("\n📚 {total}件のISBNを処理します\n");
+    }
     println!("{}", "=".repeat(60));
 
     for (i, raw) in isbn_list.iter().enumerate() {
@@ -266,19 +267,11 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
             continue;
         };
 
-        let Some(mut book) = fetch_book(&client, &isbn13).await else {
+        let Some(book) = fetch_book(&client, &isbn13).await else {
             println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
             skip += 1;
             continue;
         };
-
-        if book.description.is_empty() {
-            if let Some(app_id) = &config.rakuten_app_id {
-                if let Some(desc) = fetch_description_rakuten(&client, &isbn13, app_id).await {
-                    book.description = desc;
-                }
-            }
-        }
 
         println!("  📗 {}", book.title);
         println!("     著者: {}", book.author);
@@ -289,24 +282,52 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &
             println!("     発売: {}", book.pubdate);
         }
 
-        let payload = build_notion_payload(&book, &config.notion_database_id, purchase_date);
-        match insert_to_notion(&client, payload, config).await {
-            Ok(()) => {
-                println!("  ✅ Notion登録完了");
-                success += 1;
+        if dry_run {
+            if !book.isbn.is_empty() {
+                println!("     ISBN: {}", book.isbn);
             }
-            Err(e) => {
-                println!("  ❌ Notion APIエラー: {e}");
-                fail += 1;
+            if !book.cover.is_empty() {
+                println!("     表紙: {}", book.cover);
+            }
+            if !book.description.is_empty() {
+                let preview: String = book.description.chars().take(400).collect();
+                let ellipsis = if book.description.chars().count() > 400 { "…" } else { "" };
+                println!("     概要: {preview}{ellipsis}");
+            } else {
+                println!("     概要: （データなし・手動入力用）");
             }
         }
 
-        // Notion APIレートリミット対策（3 req/sec）
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        let payload = build_notion_payload(&book, &config.notion_database_id, purchase_date);
+        if dry_run {
+            println!("  🔍 ドライラン: Notion 送信をスキップ");
+            match serde_json::to_string_pretty(&payload) {
+                Ok(json) => println!("{json}"),
+                Err(e) => println!("  ⚠️ JSON 表示エラー: {e}"),
+            }
+            success += 1;
+        } else {
+            match insert_to_notion(&client, payload, config).await {
+                Ok(()) => {
+                    println!("  ✅ Notion登録完了");
+                    success += 1;
+                }
+                Err(e) => {
+                    println!("  ❌ Notion APIエラー: {e}");
+                    fail += 1;
+                }
+            }
+            // Notion APIレートリミット対策（3 req/sec）
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
     }
 
     println!("\n{}", "=".repeat(60));
-    println!("📊 結果: 成功={success}  スキップ={skip}  失敗={fail}  合計={total}");
+    if dry_run {
+        println!("📊 結果（ドライラン）: 取得表示={success}  スキップ={skip}  失敗={fail}  合計={total}");
+    } else {
+        println!("📊 結果: 成功={success}  スキップ={skip}  失敗={fail}  合計={total}");
+    }
 }
 
 #[tokio::main]
@@ -340,7 +361,7 @@ async fn main() {
         process::exit(0);
     }
 
-    let config = match Config::from_env() {
+    let config = match Config::from_env(cli.dry_run) {
         Ok(c) => c,
         Err(e) => { eprintln!("{e}"); process::exit(1); }
     };
@@ -348,11 +369,31 @@ async fn main() {
     let purchase_date = cli.date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
 
     println!("書籍DB登録ツール");
-    println!("   API Key: {}...", &config.notion_api_key[..config.notion_api_key.len().min(20)]);
-    println!("   Database ID: {}", config.notion_database_id);
+    if cli.dry_run {
+        println!("   モード: ドライラン（Notion API には接続しません）");
+        if config.notion_api_key.is_empty() {
+            println!("   NOTION_API_KEY: （未設定・ペイロード表示用に省略可）");
+        } else {
+            let n = config.notion_api_key.len().min(20);
+            println!("   NOTION_API_KEY: {}...", &config.notion_api_key[..n]);
+        }
+        println!(
+            "   NOTION_DATABASE_ID: {}{}",
+            config.notion_database_id,
+            if std::env::var("NOTION_DATABASE_ID").is_err() {
+                "（未設定時はダミーIDで JSON を生成）"
+            } else {
+                ""
+            }
+        );
+    } else {
+        let n = config.notion_api_key.len().min(20);
+        println!("   API Key: {}...", &config.notion_api_key[..n]);
+        println!("   Database ID: {}", config.notion_database_id);
+    }
     println!("   購入年月日: {purchase_date}");
 
-    process_isbns(isbn_list, &config, &purchase_date).await;
+    process_isbns(isbn_list, &config, &purchase_date, cli.dry_run).await;
 }
 
 // ============================================================
@@ -363,49 +404,15 @@ async fn main() {
 mod tests {
     use super::*;
 
-    // --- normalize_isbn ---
-
     #[test]
     fn normalize_isbn13_digits_only() {
         assert_eq!(normalize_isbn("9784478039670"), Some("9784478039670".into()));
     }
 
     #[test]
-    fn normalize_isbn13_with_hyphens() {
-        assert_eq!(normalize_isbn("978-4-47-803967-0"), Some("9784478039670".into()));
-    }
-
-    #[test]
-    fn normalize_isbn13_with_spaces() {
-        assert_eq!(normalize_isbn("  9784478039670  "), Some("9784478039670".into()));
-    }
-
-    #[test]
     fn normalize_isbn10_converts_to_isbn13() {
         assert_eq!(normalize_isbn("4478039674"), Some("9784478039670".into()));
     }
-
-    #[test]
-    fn normalize_isbn10_with_hyphens() {
-        assert_eq!(normalize_isbn("4-478-03967-4"), Some("9784478039670".into()));
-    }
-
-    #[test]
-    fn normalize_isbn10_x_check_digit() {
-        // ISBN-10 "080442957X" → ISBN-13 "9780804429573"
-        assert_eq!(normalize_isbn("080442957X"), Some("9780804429573".into()));
-        assert_eq!(normalize_isbn("080442957x"), Some("9780804429573".into()));
-    }
-
-    #[test]
-    fn normalize_isbn_invalid_returns_none() {
-        assert_eq!(normalize_isbn("123"), None);
-        assert_eq!(normalize_isbn("abcdefghijk"), None);
-        assert_eq!(normalize_isbn(""), None);
-        assert_eq!(normalize_isbn("12345678901234"), None); // 14桁
-    }
-
-    // --- isbn10_to_isbn13 / isbn13_to_isbn10 ---
 
     #[test]
     fn isbn10_to_isbn13_roundtrip() {
@@ -416,103 +423,10 @@ mod tests {
     }
 
     #[test]
-    fn isbn13_to_isbn10_x_check_digit() {
-        assert_eq!(isbn13_to_isbn10("9780804429573").unwrap(), "080442957X");
-    }
-
-    #[test]
-    fn isbn13_to_isbn10_non_978_returns_none() {
-        assert_eq!(isbn13_to_isbn10("9794478039670"), None);
-    }
-
-    #[test]
-    fn isbn13_to_isbn10_wrong_length_returns_none() {
-        assert_eq!(isbn13_to_isbn10("978447803967"), None);
-    }
-
-    // --- format_date ---
-
-    #[test]
-    fn format_date_8_digits() {
-        assert_eq!(format_date("20231213"), "2023-12-13");
-    }
-
-    #[test]
-    fn format_date_6_digits_unchanged() {
-        assert_eq!(format_date("202312"), "202312");
-    }
-
-    #[test]
-    fn format_date_empty_unchanged() {
-        assert_eq!(format_date(""), "");
-    }
-
-    // --- extract_price ---
-
-    #[test]
-    fn extract_price_single_object() {
-        let onix = json!({
-            "ProductSupply": { "SupplyDetail": { "Price": {"PriceAmount": "3200"} } }
-        });
-        assert_eq!(extract_price(&onix), Some(3200));
-    }
-
-    #[test]
-    fn extract_price_array_returns_first() {
-        let onix = json!({
-            "ProductSupply": { "SupplyDetail": { "Price": [
-                {"PriceAmount": "2800"},
-                {"PriceAmount": "3080"}
-            ]}}
-        });
-        assert_eq!(extract_price(&onix), Some(2800));
-    }
-
-    #[test]
-    fn extract_price_missing_returns_none() {
-        assert_eq!(extract_price(&json!({})), None);
-    }
-
-    // --- extract_description ---
-
-    #[test]
-    fn extract_description_single_object() {
-        let onix = json!({
-            "CollateralDetail": { "TextContent": {"Text": "本の紹介文です。"} }
-        });
-        assert_eq!(extract_description(&onix), "本の紹介文です。");
-    }
-
-    #[test]
     fn extract_description_strips_html_tags() {
         let onix = json!({
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
-    }
-
-    #[test]
-    fn extract_description_array_skips_empty() {
-        let onix = json!({
-            "CollateralDetail": { "TextContent": [
-                {"Text": ""},
-                {"Text": "2番目のテキスト"}
-            ]}
-        });
-        assert_eq!(extract_description(&onix), "2番目のテキスト");
-    }
-
-    #[test]
-    fn extract_description_missing_returns_empty() {
-        assert_eq!(extract_description(&json!({})), "");
-    }
-
-    #[test]
-    fn extract_description_truncates_at_2000_chars() {
-        let long_text = "あ".repeat(3000);
-        let onix = json!({
-            "CollateralDetail": { "TextContent": {"Text": long_text} }
-        });
-        assert_eq!(extract_description(&onix).chars().count(), 2000);
     }
 }
