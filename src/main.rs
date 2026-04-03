@@ -22,6 +22,10 @@ struct Cli {
     /// ISBNリストファイル（1行1ISBN）
     #[arg(short, long)]
     file: Option<String>,
+
+    /// 購入年月日（YYYY-MM-DD、省略時は今日）
+    #[arg(short, long, value_name = "YYYY-MM-DD")]
+    date: Option<String>,
 }
 
 // ============================================================
@@ -176,12 +180,11 @@ fn extract_description(onix: &Value) -> String {
 // Notion
 // ============================================================
 
-fn build_notion_payload(book: &Book, database_id: &str) -> Value {
-    let today = Local::now().format("%Y-%m-%d").to_string();
+fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> Value {
 
     let mut props = Map::new();
     props.insert("名前".into(),   json!({"title": [{"text": {"content": book.title}}]}));
-    props.insert("購入年月".into(), json!({"date": {"start": today}}));
+    props.insert("購入年月".into(), json!({"date": {"start": purchase_date}}));
 
     for (key, value) in [("代表著者", &book.author), ("発売日", &book.pubdate), ("概要", &book.description)] {
         if !value.is_empty() {
@@ -223,7 +226,7 @@ async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Con
 // Main processing
 // ============================================================
 
-async fn process_isbns(isbn_list: Vec<String>, config: &Config) {
+async fn process_isbns(isbn_list: Vec<String>, config: &Config, purchase_date: &str) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -259,7 +262,7 @@ async fn process_isbns(isbn_list: Vec<String>, config: &Config) {
             println!("     発売: {}", book.pubdate);
         }
 
-        let payload = build_notion_payload(&book, &config.notion_database_id);
+        let payload = build_notion_payload(&book, &config.notion_database_id, purchase_date);
         match insert_to_notion(&client, payload, config).await {
             Ok(()) => {
                 println!("  ✅ Notion登録完了");
@@ -316,9 +319,13 @@ async fn main() {
         process::exit(1);
     }
 
+    let purchase_date = cli.date.unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+
     println!("書籍DB登録ツール");
     println!("   API Key: {}...", &config.notion_api_key[..config.notion_api_key.len().min(20)]);
     println!("   Database ID: {}", config.notion_database_id);
+    println!("   購入年月日: {purchase_date}");
 
-    process_isbns(isbn_list, &config).await;
+    process_isbns(isbn_list, &config, &purchase_date).await;
 }
+
