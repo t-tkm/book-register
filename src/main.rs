@@ -158,10 +158,13 @@ fn get_book_cover_url(isbn13: &str, openbd_cover: &str) -> String {
     if !openbd_cover.is_empty() {
         return openbd_cover.to_string();
     }
-    
+
     // OpenBDに画像がない場合、Amazon商品画像を使用
     if let Some(isbn10) = isbn13_to_isbn10(isbn13) {
-        format!("https://images-na.ssl-images-amazon.com/images/P/{}.01.L.jpg", isbn10)
+        format!(
+            "https://images-na.ssl-images-amazon.com/images/P/{}.01.L.jpg",
+            isbn10
+        )
     } else {
         String::new()
     }
@@ -213,7 +216,10 @@ fn parse_openbd(data: &Value) -> Option<Book> {
         title,
         author: summary["author"].as_str().unwrap_or("").to_string(),
         pubdate: format_date(summary["pubdate"].as_str().unwrap_or("")),
-        cover: get_book_cover_url(summary["isbn"].as_str().unwrap_or(""), summary["cover"].as_str().unwrap_or("")),
+        cover: get_book_cover_url(
+            summary["isbn"].as_str().unwrap_or(""),
+            summary["cover"].as_str().unwrap_or(""),
+        ),
         isbn: summary["isbn"].as_str().unwrap_or("").to_string(),
         price: extract_price(onix),
         description: extract_description(onix),
@@ -295,12 +301,15 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
         );
     }
     if !book.cover.is_empty() {
-        props.insert("画像".into(), json!({
-            "files": [{
-                "name": "cover.jpg",
-                "external": {"url": book.cover}
-            }]
-        }));
+        props.insert(
+            "画像".into(),
+            json!({
+                "files": [{
+                    "name": "cover.jpg",
+                    "external": {"url": book.cover}
+                }]
+            }),
+        );
     }
 
     json!({ "parent": {"database_id": database_id}, "properties": props })
