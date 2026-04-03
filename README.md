@@ -121,6 +121,8 @@ Notion データベース
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | URL      | `summary.cover`                                     |
+| ジャンル        | —        | N/A（手動入力）                                      |
+| メモ            | —        | N/A（手動入力）                                      |
 
 ### 利用サービス
 
