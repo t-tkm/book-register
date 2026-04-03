@@ -86,6 +86,51 @@ ISBNリストファイルは1行1ISBN。`#` で始まる行はコメントとし
 
 ---
 
+## 付録
+
+### アーキテクチャ
+
+```
+入力 (ISBN)
+    │
+    ▼
+ISBN正規化
+  ISBN-10 / ISBN-13・ハイフン有無を吸収 → ISBN-13 に統一
+    │
+    ▼
+OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
+  日本の書籍流通データベース（無料・登録不要）
+    │
+    ▼
+Notion API  https://api.notion.com/v1/pages
+  取得した書誌情報をページとして挿入
+    │
+    ▼
+Notion データベース
+```
+
+### フィールドマッピング
+
+| Notion プロパティ | 型       | 取得元                                              |
+|----------------|---------|-----------------------------------------------------|
+| 名前            | タイトル  | `summary.title`                                     |
+| 代表著者        | テキスト  | `summary.author`                                    |
+| 発売日          | テキスト  | `summary.pubdate`（`YYYYMMDD` → `YYYY-MM-DD` に変換）|
+| 概要            | テキスト  | `onix.CollateralDetail.TextContent[].Text`（HTMLタグ除去・2000文字上限）|
+| 購入年月        | 日付     | 実行日（`--date` オプションで上書き可）               |
+| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
+| AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
+| 画像            | URL      | `summary.cover`                                     |
+
+### 利用サービス
+
+| サービス | 用途 | 認証 |
+|---------|------|------|
+| [OpenBD](https://openbd.jp/) | 書誌情報取得 | 不要 |
+| [Notion API](https://developers.notion.com/) | データベース挿入 | `NOTION_API_KEY` |
+
+---
+
 ## 開発
 
 ### ビルド
