@@ -30,6 +30,10 @@ struct Cli {
     /// Notion に送信せず、OpenBDの取得結果と送信予定 JSON を標準出力のみに出す
     #[arg(long = "dry-run")]
     dry_run: bool,
+
+    /// 重複確認をスキップして強制登録する
+    #[arg(long)]
+    force: bool,
 }
 
 // ============================================================
@@ -315,6 +319,55 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
     json!({ "parent": {"database_id": database_id}, "properties": props })
 }
 
+async fn find_duplicate_in_notion(
+    client: &reqwest::Client,
+    isbn13: &str,
+    config: &Config,
+) -> bool {
+    let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
+        return false;
+    };
+    let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
+    let query = json!({
+        "filter": {
+            "property": "AmazonURL",
+            "url": {"equals": amazon_url}
+        }
+    });
+    let Ok(response) = client
+        .post(format!(
+            "https://api.notion.com/v1/databases/{}/query",
+            config.notion_database_id
+        ))
+        .header("Authorization", format!("Bearer {}", config.notion_api_key))
+        .header("Notion-Version", "2022-06-28")
+        .json(&query)
+        .send()
+        .await
+    else {
+        return false;
+    };
+    let Ok(data): Result<Value, _> = response.json().await else {
+        return false;
+    };
+    if data["object"].as_str() == Some("error") {
+        return false;
+    }
+    data["results"]
+        .as_array()
+        .map(|r| !r.is_empty())
+        .unwrap_or(false)
+}
+
+fn prompt_overwrite(title: &str) -> bool {
+    use std::io::{self, Write};
+    print!("  ⚠️  重複: 「{title}」は既にNotionに登録されています。上書き登録しますか？ [y/N]: ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Config) -> Result<()> {
     let response: Value = client
         .post("https://api.notion.com/v1/pages")
@@ -342,6 +395,7 @@ async fn process_isbns(
     config: &Config,
     purchase_date: &str,
     dry_run: bool,
+    force: bool,
 ) {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -411,6 +465,13 @@ async fn process_isbns(
             }
             success += 1;
         } else {
+            if !force && find_duplicate_in_notion(&client, &isbn13, config).await {
+                if !prompt_overwrite(&book.title) {
+                    println!("  ⏭️  スキップ（重複登録キャンセル）");
+                    skip += 1;
+                    continue;
+                }
+            }
             match insert_to_notion(&client, payload, config).await {
                 Ok(()) => {
                     println!("  ✅ Notion登録完了");
@@ -532,7 +593,7 @@ async fn main() {
     }
     println!("   購入年月日: {purchase_date}");
 
-    process_isbns(isbn_list, &config, &purchase_date, cli.dry_run).await;
+    process_isbns(isbn_list, &config, &purchase_date, cli.dry_run, cli.force).await;
 }
 
 // ============================================================
