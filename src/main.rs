@@ -319,11 +319,7 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
     json!({ "parent": {"database_id": database_id}, "properties": props })
 }
 
-async fn find_duplicate_in_notion(
-    client: &reqwest::Client,
-    isbn13: &str,
-    config: &Config,
-) -> bool {
+async fn find_duplicate_in_notion(client: &reqwest::Client, isbn13: &str, config: &Config) -> bool {
     let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
         return false;
     };
