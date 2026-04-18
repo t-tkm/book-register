@@ -227,12 +227,10 @@ fn parse_openbd(data: &Value) -> Option<Book> {
 }
 
 fn format_date(raw: &str) -> String {
-    if raw.len() == 8 && raw.chars().all(|c| c.is_ascii_digit()) {
-        format!("{}-{}-{}", &raw[..4], &raw[4..6], &raw[6..8])
-    } else if raw.len() == 6 && raw.chars().all(|c| c.is_ascii_digit()) {
-        format!("{}-{}-01", &raw[..4], &raw[4..6])
+    if raw.len() >= 6 && raw[..6].chars().all(|c| c.is_ascii_digit()) {
+        raw[..6].to_string()
     } else {
-        raw.to_string()
+        String::new()
     }
 }
 
@@ -281,7 +279,7 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
 
     for (key, value) in [
         ("代表著者", &book.author),
-        ("発売日", &book.pubdate),
+        ("出版月", &book.pubdate),
         ("概要", &book.description),
     ] {
         if !value.is_empty() {
