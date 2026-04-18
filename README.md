@@ -37,7 +37,7 @@ cp .env.example .env
 |------------|---------|
 | 名前        | タイトル  |
 | 代表著者    | テキスト  |
-| 発売日      | テキスト  |
+| 出版月      | テキスト  |
 | 概要        | テキスト  |
 | 購入年月    | 日付     |
 | 価格        | 数値     |
@@ -50,7 +50,7 @@ cp .env.example .env
 # ISBNを直接指定（複数可）
 book_register 9784478039670 9784798067278
 
-# 購入日を指定（省略時は今日）
+# 購入日を指定（省略時は空で登録）
 book_register -d 2026-03-15 9784478039670
 
 # ISBNリストファイルを指定
@@ -90,9 +90,9 @@ Notion API  https://api.notion.com/v1/pages
 |----------------|---------|-----------------------------------------------------|
 | 名前            | タイトル  | `summary.title`                                     |
 | 代表著者        | テキスト  | `summary.author`                                    |
-| 発売日          | テキスト  | `summary.pubdate`（`YYYYMMDD` → `YYYY-MM-DD` に変換）|
+| 出版月          | テキスト  | `summary.pubdate`（`YYYYMMDD` / `YYYYMM` → `YYYYMM` に変換）|
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合はNotionで手動入力） |
-| 購入年月        | 日付     | 実行日（`--date` オプションで上書き可）               |
+| 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUIで入力）|
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | URL      | `summary.cover`                                     |
