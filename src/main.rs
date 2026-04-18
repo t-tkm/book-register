@@ -1,7 +1,7 @@
 use std::{path::Path, process, time::Duration};
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 use clap::Parser;
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -496,9 +496,13 @@ async fn main() {
         }
     };
 
-    let purchase_date = cli
-        .date
-        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
+    let purchase_date = match cli.date {
+        Some(d) => d,
+        None => {
+            eprintln!("❌ --date を指定してください（例: --date 2026-04-19）");
+            process::exit(1);
+        }
+    };
     if let Err(e) = validate_purchase_date(&purchase_date) {
         eprintln!("{e}");
         process::exit(1);
