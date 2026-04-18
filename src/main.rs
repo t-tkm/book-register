@@ -1,7 +1,7 @@
 use std::{path::Path, process, time::Duration};
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate};
+use chrono::NaiveDate;
 use clap::Parser;
 use regex::Regex;
 use serde_json::{json, Map, Value};
@@ -275,7 +275,9 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
         "名前".into(),
         json!({"title": [{"text": {"content": book.title}}]}),
     );
-    props.insert("購入年月".into(), json!({"date": {"start": purchase_date}}));
+    if !purchase_date.is_empty() {
+        props.insert("購入年月".into(), json!({"date": {"start": purchase_date}}));
+    }
 
     for (key, value) in [
         ("代表著者", &book.author),
@@ -496,12 +498,12 @@ async fn main() {
         }
     };
 
-    let purchase_date = cli
-        .date
-        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string());
-    if let Err(e) = validate_purchase_date(&purchase_date) {
-        eprintln!("{e}");
-        process::exit(1);
+    let purchase_date = cli.date.unwrap_or_default();
+    if !purchase_date.is_empty() {
+        if let Err(e) = validate_purchase_date(&purchase_date) {
+            eprintln!("{e}");
+            process::exit(1);
+        }
     }
 
     println!("書籍DB登録ツール");
