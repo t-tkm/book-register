@@ -461,12 +461,13 @@ async fn process_isbns(
             }
             success += 1;
         } else {
-            if !force && find_duplicate_in_notion(&client, &isbn13, config).await {
-                if !prompt_overwrite(&book.title) {
-                    println!("  ⏭️  スキップ（重複登録キャンセル）");
-                    skip += 1;
-                    continue;
-                }
+            if !force
+                && find_duplicate_in_notion(&client, &isbn13, config).await
+                && !prompt_overwrite(&book.title)
+            {
+                println!("  ⏭️  スキップ（重複登録キャンセル）");
+                skip += 1;
+                continue;
             }
             match insert_to_notion(&client, payload, config).await {
                 Ok(()) => {
