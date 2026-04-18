@@ -44,6 +44,47 @@ cp .env.example .env
 | AmazonURL  | URL      |
 | 画像        | URL      |
 
+## Releaseバイナリの使い方
+
+ビルド済みバイナリを [GitHub Releases](https://github.com/t-tkm/book-register/releases) からダウンロードして使う方法。
+
+### 1. バイナリのダウンロード
+
+Releases ページから OS に合ったアーカイブを取得する。
+
+| OS      | ファイル名の例                                      |
+|---------|---------------------------------------------------|
+| macOS   | `book_register-v0.x.x-aarch64-apple-darwin.tar.gz`（Apple Silicon）<br>`book_register-v0.x.x-x86_64-apple-darwin.tar.gz`（Intel） |
+| Linux   | `book_register-v0.x.x-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows | `book_register-v0.x.x-x86_64-pc-windows-msvc.zip` |
+
+### 2. 展開と実行権限の付与（macOS / Linux）
+
+```sh
+tar xzf book_register-*.tar.gz
+chmod +x book_register
+```
+
+### 3. macOS: 隔離属性の解除
+
+macOS では Gatekeeper によりインターネット経由でダウンロードしたバイナリに隔離属性が付与され、そのままでは実行できない。以下のコマンドで属性を削除する。
+
+```sh
+xattr -d com.apple.quarantine book_register
+```
+
+> **確認方法**: `xattr book_register` を実行して何も表示されなければ解除済み。
+
+### 4. パスの通った場所へ移動（任意）
+
+```sh
+mv book_register /usr/local/bin/
+```
+
+移動後はどのディレクトリからでも `book_register` コマンドとして呼び出せる。
+
+---
+
 ## 使い方
 
 ```sh
