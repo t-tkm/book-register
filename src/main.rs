@@ -328,10 +328,12 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
     json!({ "parent": {"database_id": database_id}, "properties": props })
 }
 
-async fn find_duplicate_in_notion(client: &reqwest::Client, isbn13: &str, config: &Config) -> bool {
-    let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
-        return false;
-    };
+async fn find_duplicate_in_notion(
+    client: &reqwest::Client,
+    isbn13: &str,
+    config: &Config,
+) -> Option<(String, Value)> {
+    let isbn10 = isbn13_to_isbn10(isbn13)?;
     let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
     let query = json!({
         "filter": {
@@ -339,7 +341,7 @@ async fn find_duplicate_in_notion(client: &reqwest::Client, isbn13: &str, config
             "url": {"equals": amazon_url}
         }
     });
-    let Ok(response) = client
+    let response = client
         .post(format!(
             "https://api.notion.com/v1/databases/{}/query",
             config.notion_database_id
@@ -349,24 +351,52 @@ async fn find_duplicate_in_notion(client: &reqwest::Client, isbn13: &str, config
         .json(&query)
         .send()
         .await
-    else {
-        return false;
-    };
-    let Ok(data): Result<Value, _> = response.json().await else {
-        return false;
-    };
+        .ok()?;
+    let data: Value = response.json().await.ok()?;
     if data["object"].as_str() == Some("error") {
-        return false;
+        return None;
     }
-    data["results"]
+    let page = data["results"].as_array()?.first()?;
+    let page_id = page["id"].as_str()?.to_string();
+    Some((page_id, page["properties"].clone()))
+}
+
+fn print_existing_entry(props: &Value) {
+    let title = props["名前"]["title"]
         .as_array()
-        .map(|r| !r.is_empty())
-        .unwrap_or(false)
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let author = props["代表著者"]["rich_text"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let pubdate = props["出版月"]["rich_text"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let price = props["価格"]["number"]
+        .as_f64()
+        .map(|p| format!("￥{}", p as u64))
+        .unwrap_or_else(|| "（不明）".to_string());
+    let purchase = props["購入年月"]["date"]["start"]
+        .as_str()
+        .unwrap_or("（未登録）");
+
+    println!("  ┌─ 既存エントリ ──────────────────────");
+    println!("  │  書名:   {title}");
+    println!("  │  著者:   {author}");
+    println!("  │  出版月: {pubdate}");
+    println!("  │  価格:   {price}");
+    println!("  │  購入日: {purchase}");
+    println!("  └───────────────────────────────────");
 }
 
 fn prompt_overwrite(title: &str) -> bool {
     use std::io::{self, Write};
-    print!("  ⚠️  重複: 「{title}」は既にNotionに登録されています。上書き登録しますか？ [y/N]: ");
+    print!("  ⚠️  上記エントリを「{title}」の新しいデータで上書きしますか？ [y/N]: ");
     io::stdout().flush().ok();
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
@@ -379,6 +409,31 @@ async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Con
         .header("Authorization", format!("Bearer {}", config.notion_api_key))
         .header("Notion-Version", "2022-06-28")
         .json(&payload)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if response["object"].as_str() == Some("error") {
+        let msg = response["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
+async fn update_notion_page(
+    client: &reqwest::Client,
+    page_id: &str,
+    payload: Value,
+    config: &Config,
+) -> Result<()> {
+    let properties = payload["properties"].clone();
+    let body = json!({ "properties": properties });
+    let response: Value = client
+        .patch(format!("https://api.notion.com/v1/pages/{page_id}"))
+        .header("Authorization", format!("Bearer {}", config.notion_api_key))
+        .header("Notion-Version", "2022-06-28")
+        .json(&body)
         .send()
         .await?
         .json()
@@ -470,17 +525,37 @@ async fn process_isbns(
             }
             success += 1;
         } else {
-            if !force
-                && find_duplicate_in_notion(&client, &isbn13, config).await
-                && !prompt_overwrite(&book.title)
-            {
-                println!("  ⏭️  スキップ（重複登録キャンセル）");
-                skip += 1;
-                continue;
-            }
-            match insert_to_notion(&client, payload, config).await {
-                Ok(()) => {
-                    println!("  ✅ Notion登録完了");
+            let duplicate = if force {
+                None
+            } else {
+                find_duplicate_in_notion(&client, &isbn13, config).await
+            };
+
+            let result = match duplicate {
+                Some((ref page_id, ref existing_props)) => {
+                    print_existing_entry(existing_props);
+                    if prompt_overwrite(&book.title) {
+                        update_notion_page(&client, page_id, payload, config)
+                            .await
+                            .map(|_| true)
+                    } else {
+                        println!("  ⏭️  スキップ（重複登録キャンセル）");
+                        skip += 1;
+                        continue;
+                    }
+                }
+                None => insert_to_notion(&client, payload, config)
+                    .await
+                    .map(|_| false),
+            };
+
+            match result {
+                Ok(updated) => {
+                    if updated {
+                        println!("  ✅ Notion更新完了");
+                    } else {
+                        println!("  ✅ Notion登録完了");
+                    }
                     success += 1;
                 }
                 Err(e) => {
