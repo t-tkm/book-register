@@ -22,6 +22,7 @@ cp .env.example .env
 
 - **NOTION_API_KEY**: [My integrations](https://www.notion.so/my-integrations) でインテグレーションを作成すると発行される。登録先のデータベースにそのインテグレーションを接続しておく必要がある。
 - **NOTION_DATABASE_ID**: データベースをブラウザで開いたときのURL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
+- **TAX_RATE**（省略可）: 価格に乗じる税率。省略時は `1.10`（10%）。
 
 公開リポジトリで運用する場合:
 
@@ -134,7 +135,7 @@ Notion API  https://api.notion.com/v1/pages
 | 出版月          | テキスト  | `summary.pubdate`（`YYYYMMDD` / `YYYYMM` → `YYYYMM` に変換）|
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合はNotionで手動入力） |
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUIで入力）|
-| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount`（税抜）|
+| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount` に `TAX_RATE` を乗じた税込価格|
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | URL      | `summary.cover`                                     |
 
