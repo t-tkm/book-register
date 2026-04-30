@@ -43,10 +43,16 @@ struct Cli {
 struct Config {
     notion_api_key: String,
     notion_database_id: String,
+    tax_rate: f64,
 }
 
 impl Config {
     fn from_env(dry_run: bool) -> Result<Self, String> {
+        let tax_rate = std::env::var("TAX_RATE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(1.10);
+
         if dry_run {
             return Ok(Self {
                 notion_api_key: std::env::var("NOTION_API_KEY")
@@ -57,6 +63,7 @@ impl Config {
                     .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string())
                     .trim()
                     .to_string(),
+                tax_rate,
             });
         }
         let api_key = std::env::var("NOTION_API_KEY")
@@ -68,6 +75,7 @@ impl Config {
         Ok(Self {
             notion_api_key: api_key,
             notion_database_id: database_id,
+            tax_rate,
         })
     }
 }
@@ -197,17 +205,17 @@ fn isbn13_to_isbn10(isbn13: &str) -> Option<String> {
 // OpenBD
 // ============================================================
 
-async fn fetch_book(client: &reqwest::Client, isbn13: &str) -> Option<Book> {
+async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Option<Book> {
     let url = format!("https://api.openbd.jp/v1/get?isbn={isbn13}");
     let data: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
     let entry = data.get(0)?;
     if entry.is_null() {
         return None;
     }
-    parse_openbd(entry)
+    parse_openbd(entry, tax_rate)
 }
 
-fn parse_openbd(data: &Value) -> Option<Book> {
+fn parse_openbd(data: &Value, tax_rate: f64) -> Option<Book> {
     let summary = &data["summary"];
     let onix = &data["onix"];
 
@@ -225,7 +233,7 @@ fn parse_openbd(data: &Value) -> Option<Book> {
             summary["cover"].as_str().unwrap_or(""),
         ),
         isbn: summary["isbn"].as_str().unwrap_or("").to_string(),
-        price: extract_price(onix),
+        price: extract_price(onix, tax_rate),
         description: extract_description(onix),
     })
 }
@@ -238,7 +246,7 @@ fn format_date(raw: &str) -> String {
     }
 }
 
-fn extract_price(onix: &Value) -> Option<u32> {
+fn extract_price(onix: &Value, tax_rate: f64) -> Option<u32> {
     let prices = &onix["ProductSupply"]["SupplyDetail"]["Price"];
     let list: Vec<&Value> = match prices {
         Value::Array(a) => a.iter().collect(),
@@ -247,6 +255,7 @@ fn extract_price(onix: &Value) -> Option<u32> {
     };
     list.iter()
         .find_map(|p| p["PriceAmount"].as_str()?.parse::<u32>().ok())
+        .map(|price_excl| (price_excl as f64 * tax_rate).round() as u32)
 }
 
 fn extract_description(onix: &Value) -> String {
@@ -417,7 +426,7 @@ async fn process_isbns(
             continue;
         };
 
-        let Some(book) = fetch_book(&client, &isbn13).await else {
+        let Some(book) = fetch_book(&client, &isbn13, config.tax_rate).await else {
             println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
             skip += 1;
             continue;
@@ -426,7 +435,7 @@ async fn process_isbns(
         println!("  📗 {}", book.title);
         println!("     著者: {}", book.author);
         if let Some(price) = book.price {
-            println!("     定価: ￥{price}（税抜）");
+            println!("     定価: ￥{price}（税込）");
         }
         if !book.pubdate.is_empty() {
             println!("     発売: {}", book.pubdate);
