@@ -332,7 +332,7 @@ async fn find_duplicate_in_notion(
     client: &reqwest::Client,
     isbn13: &str,
     config: &Config,
-) -> Option<String> {
+) -> Option<(String, Value)> {
     let isbn10 = isbn13_to_isbn10(isbn13)?;
     let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
     let query = json!({
@@ -356,17 +356,47 @@ async fn find_duplicate_in_notion(
     if data["object"].as_str() == Some("error") {
         return None;
     }
-    data["results"]
-        .as_array()?
-        .first()?
-        ["id"]
+    let page = data["results"].as_array()?.first()?;
+    let page_id = page["id"].as_str()?.to_string();
+    Some((page_id, page["properties"].clone()))
+}
+
+fn print_existing_entry(props: &Value) {
+    let title = props["名前"]["title"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let author = props["代表著者"]["rich_text"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let pubdate = props["出版月"]["rich_text"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|t| t["plain_text"].as_str())
+        .unwrap_or("（不明）");
+    let price = props["価格"]["number"]
+        .as_f64()
+        .map(|p| format!("￥{}", p as u64))
+        .unwrap_or_else(|| "（不明）".to_string());
+    let purchase = props["購入年月"]["date"]["start"]
         .as_str()
-        .map(|s| s.to_string())
+        .unwrap_or("（未登録）");
+
+    println!("  ┌─ 既存エントリ ──────────────────────");
+    println!("  │  書名:   {title}");
+    println!("  │  著者:   {author}");
+    println!("  │  出版月: {pubdate}");
+    println!("  │  価格:   {price}");
+    println!("  │  購入日: {purchase}");
+    println!("  └───────────────────────────────────");
 }
 
 fn prompt_overwrite(title: &str) -> bool {
     use std::io::{self, Write};
-    print!("  ⚠️  重複: 「{title}」は既にNotionに登録されています。上書き登録しますか？ [y/N]: ");
+    print!("  ⚠️  上記エントリを「{title}」の新しいデータで上書きしますか？ [y/N]: ");
     io::stdout().flush().ok();
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
@@ -495,14 +525,15 @@ async fn process_isbns(
             }
             success += 1;
         } else {
-            let duplicate_page_id = if force {
+            let duplicate = if force {
                 None
             } else {
                 find_duplicate_in_notion(&client, &isbn13, config).await
             };
 
-            let result = match duplicate_page_id {
-                Some(ref page_id) => {
+            let result = match duplicate {
+                Some((ref page_id, ref existing_props)) => {
+                    print_existing_entry(existing_props);
                     if prompt_overwrite(&book.title) {
                         update_notion_page(&client, page_id, payload, config)
                             .await
