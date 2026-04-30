@@ -544,7 +544,9 @@ async fn process_isbns(
                         continue;
                     }
                 }
-                None => insert_to_notion(&client, payload, config).await.map(|_| false),
+                None => insert_to_notion(&client, payload, config)
+                    .await
+                    .map(|_| false),
             };
 
             match result {
