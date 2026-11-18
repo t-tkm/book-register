@@ -1077,4 +1077,174 @@ mod tests {
     fn validate_purchase_date_rejects_invalid_date() {
         assert!(validate_purchase_date("2026-02-30").is_err());
     }
+
+    // ---------- build_notion_payload ----------
+
+    fn full_book() -> Book {
+        Book {
+            title: "テスト書籍".into(),
+            author: "山田太郎".into(),
+            pubdate: "202403".into(),
+            cover: "https://cover.openbd.jp/9784478039670.jpg".into(),
+            price: Some(1650),
+            description: "概要テキスト".into(),
+            isbn: "9784478039670".into(),
+        }
+    }
+
+    fn empty_book() -> Book {
+        Book {
+            title: "タイトルのみ".into(),
+            author: String::new(),
+            pubdate: String::new(),
+            cover: String::new(),
+            price: None,
+            description: String::new(),
+            // 979 始まりは ISBN-10 に変換できない
+            isbn: "9791234567896".into(),
+        }
+    }
+
+    #[test]
+    fn build_notion_payload_includes_all_fields() {
+        let payload = build_notion_payload(&full_book(), "db-id", "2026-03-15");
+        let props = &payload["properties"];
+
+        assert_eq!(payload["parent"]["database_id"], "db-id");
+        assert_eq!(props["名前"]["title"][0]["text"]["content"], "テスト書籍");
+        assert_eq!(props["購入年月"]["date"]["start"], "2026-03-15");
+        assert_eq!(
+            props["代表著者"]["rich_text"][0]["text"]["content"],
+            "山田太郎"
+        );
+        assert_eq!(props["出版月"]["rich_text"][0]["text"]["content"], "202403");
+        assert_eq!(
+            props["概要"]["rich_text"][0]["text"]["content"],
+            "概要テキスト"
+        );
+        assert_eq!(props["価格"]["number"], 1650);
+        assert_eq!(
+            props["AmazonURL"]["url"],
+            "https://www.amazon.co.jp/dp/4478039674/"
+        );
+        assert_eq!(props["画像"]["files"][0]["name"], "cover.jpg");
+        assert_eq!(
+            props["画像"]["files"][0]["external"]["url"],
+            "https://cover.openbd.jp/9784478039670.jpg"
+        );
+    }
+
+    #[test]
+    fn build_notion_payload_omits_empty_fields() {
+        let payload = build_notion_payload(&empty_book(), "db-id", "");
+        let props = payload["properties"].as_object().unwrap();
+
+        let keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["名前"]);
+    }
+
+    #[test]
+    fn build_notion_payload_purchase_date_is_optional() {
+        let with_date = build_notion_payload(&full_book(), "db-id", "2026-03-15");
+        assert!(with_date["properties"].get("購入年月").is_some());
+
+        let without_date = build_notion_payload(&full_book(), "db-id", "");
+        assert!(without_date["properties"].get("購入年月").is_none());
+    }
+
+    // ---------- extract_price ----------
+    // PriceType ごとの選択は上の extract_price_* テスト（#18）で検証済み。ここでは形式・税率・端数を検証する
+
+    fn onix_with_price(price: Value) -> Value {
+        json!({ "ProductSupply": { "SupplyDetail": { "Price": price } } })
+    }
+
+    #[test]
+    fn extract_price_from_array_uses_first_numeric_amount() {
+        let onix = onix_with_price(json!([
+            {"PriceType": "01"},
+            {"PriceAmount": "abc"},
+            {"PriceAmount": "1500"},
+            {"PriceAmount": "9999"}
+        ]));
+        assert_eq!(extract_price(&onix, 1.10), Some(1650));
+    }
+
+    #[test]
+    fn extract_price_from_object() {
+        let onix = onix_with_price(json!({"PriceAmount": "2000"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(2200));
+    }
+
+    #[test]
+    fn extract_price_applies_tax_rate() {
+        let onix = onix_with_price(json!({"PriceAmount": "1000"}));
+        assert_eq!(extract_price(&onix, 1.0), Some(1000));
+        assert_eq!(extract_price(&onix, 1.08), Some(1080));
+    }
+
+    #[test]
+    fn extract_price_rounds_to_nearest() {
+        // 1001 * 1.10 = 1101.1 → 1101（切り下げ方向）
+        assert_eq!(
+            extract_price(&onix_with_price(json!({"PriceAmount": "1001"})), 1.10),
+            Some(1101)
+        );
+        // 1235 * 1.08 = 1333.8 → 1334（切り上げ方向）
+        assert_eq!(
+            extract_price(&onix_with_price(json!({"PriceAmount": "1235"})), 1.08),
+            Some(1334)
+        );
+        // 1005 * 1.10 = 1105.5 → 1106（0.5 は切り上げ）
+        assert_eq!(
+            extract_price(&onix_with_price(json!({"PriceAmount": "1005"})), 1.10),
+            Some(1106)
+        );
+    }
+
+    #[test]
+    fn extract_price_returns_none_for_empty_or_invalid_amount() {
+        assert_eq!(extract_price(&json!({}), 1.10), None);
+        assert_eq!(extract_price(&onix_with_price(json!([])), 1.10), None);
+        assert_eq!(
+            extract_price(&onix_with_price(json!([{"PriceAmount": "abc"}])), 1.10),
+            None
+        );
+    }
+
+    // ---------- parse_openbd ----------
+    // 著者名の整形は #19 で扱うため、ここでは著者名の検証は行わない
+
+    #[test]
+    fn parse_openbd_returns_none_without_title() {
+        let missing = json!({ "summary": { "isbn": "9784478039670" }, "onix": {} });
+        assert!(parse_openbd(&missing, 1.10).is_none());
+
+        let empty = json!({ "summary": { "title": "", "isbn": "9784478039670" }, "onix": {} });
+        assert!(parse_openbd(&empty, 1.10).is_none());
+    }
+
+    #[test]
+    fn parse_openbd_builds_book() {
+        let data = json!({
+            "summary": {
+                "title": "テスト書籍",
+                "isbn": "9784478039670",
+                "pubdate": "20240315",
+                "cover": ""
+            },
+            "onix": onix_with_price(json!({"PriceAmount": "1500"}))
+        });
+        let book = parse_openbd(&data, 1.10).unwrap();
+
+        assert_eq!(book.title, "テスト書籍");
+        assert_eq!(book.isbn, "9784478039670");
+        assert_eq!(book.pubdate, "202403");
+        assert_eq!(book.price, Some(1650));
+        // OpenBD に画像がない場合は Amazon 画像にフォールバック
+        assert_eq!(
+            book.cover,
+            "https://images-na.ssl-images-amazon.com/images/P/4478039674.01.L.jpg"
+        );
+    }
 }
