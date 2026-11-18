@@ -38,6 +38,10 @@ struct Cli {
     /// 指定 ISBN の登録済みエントリを削除する（Notion のゴミ箱へ移動）
     #[arg(long, conflicts_with = "date")]
     delete: bool,
+
+    /// 既存エントリの ISBN 列を AmazonURL から埋め戻す（--dry-run 併用で更新せず対象一覧のみ表示）
+    #[arg(long = "backfill-isbn", conflicts_with_all = ["isbn", "file", "date", "force"])]
+    backfill_isbn: bool,
 }
 
 // ============================================================
@@ -227,7 +231,13 @@ async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Re
         .json()
         .await
         .context("レスポンスの JSON 解析に失敗")?;
-    parse_openbd_response(&data, tax_rate)
+    let mut book = parse_openbd_response(&data, tax_rate)?;
+    if let Some(book) = book.as_mut() {
+        if book.isbn.is_empty() {
+            book.isbn = isbn13.to_string();
+        }
+    }
+    Ok(book)
 }
 
 /// OpenBD のレスポンス（配列）を解釈する。該当なしは `null` 要素で返る。
@@ -415,7 +425,26 @@ fn extract_description(onix: &Value) -> String {
 // Notion
 // ============================================================
 
-fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> Value {
+const NOTION_VERSION: &str = "2022-06-28";
+const ISBN_PROPERTY: &str = "ISBN";
+
+fn amazon_url(isbn10: &str) -> String {
+    format!("https://www.amazon.co.jp/dp/{isbn10}/")
+}
+
+/// AmazonURL（`/dp/{ISBN-10}/`）から ISBN-13 を復元する
+fn isbn13_from_amazon_url(url: &str) -> Option<String> {
+    let re = Regex::new(r"/dp/([0-9]{9}[0-9Xx])(?:[/?#]|$)").unwrap();
+    let isbn10 = re.captures(url)?.get(1)?.as_str();
+    normalize_isbn(isbn10)
+}
+
+fn build_notion_payload(
+    book: &Book,
+    database_id: &str,
+    purchase_date: &str,
+    include_isbn: bool,
+) -> Value {
     let mut props = Map::new();
     props.insert(
         "名前".into(),
@@ -440,11 +469,14 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
     if let Some(price) = book.price {
         props.insert("価格".into(), json!({"number": price}));
     }
-    if let Some(isbn10) = isbn13_to_isbn10(&book.isbn) {
+    if include_isbn && !book.isbn.is_empty() {
         props.insert(
-            "AmazonURL".into(),
-            json!({"url": format!("https://www.amazon.co.jp/dp/{isbn10}/")}),
+            ISBN_PROPERTY.into(),
+            json!({"rich_text": [{"text": {"content": book.isbn}}]}),
         );
+    }
+    if let Some(isbn10) = isbn13_to_isbn10(&book.isbn) {
+        props.insert("AmazonURL".into(), json!({"url": amazon_url(&isbn10)}));
     }
     if !book.cover.is_empty() {
         props.insert(
@@ -461,34 +493,88 @@ fn build_notion_payload(book: &Book, database_id: &str, purchase_date: &str) -> 
     json!({ "parent": {"database_id": database_id}, "properties": props })
 }
 
-async fn find_duplicate_in_notion(
-    client: &reqwest::Client,
-    isbn13: &str,
-    config: &Config,
-) -> Result<Option<(String, Value)>> {
-    // 979 始まりの ISBN は ISBN-10 に変換できず AmazonURL も登録しないため、照合しようがない
-    let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
-        return Ok(None);
-    };
-    let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
-    let query = json!({
-        "filter": {
+/// DB に ISBN（テキスト）プロパティがあるかを確認する
+async fn database_has_isbn_property(client: &reqwest::Client, config: &Config) -> Result<bool> {
+    let data: Value = client
+        .get(format!(
+            "https://api.notion.com/v1/databases/{}",
+            config.notion_database_id
+        ))
+        .header("Authorization", format!("Bearer {}", config.notion_api_key))
+        .header("Notion-Version", NOTION_VERSION)
+        .send()
+        .await?
+        .json()
+        .await?;
+    if data["object"].as_str() == Some("error") {
+        let msg = data["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
+    }
+    Ok(data["properties"][ISBN_PROPERTY]["type"].as_str() == Some("rich_text"))
+}
+
+/// 重複判定用フィルタ。ISBN 列があれば ISBN-13 一致、978 始まりなら AmazonURL 一致（既存データ互換）を OR で結ぶ
+fn build_duplicate_filter(isbn13: &str, has_isbn_property: bool) -> Option<Value> {
+    let mut conditions = Vec::new();
+    if has_isbn_property {
+        conditions.push(json!({
+            "property": ISBN_PROPERTY,
+            "rich_text": {"equals": isbn13}
+        }));
+    }
+    if let Some(isbn10) = isbn13_to_isbn10(isbn13) {
+        conditions.push(json!({
             "property": "AmazonURL",
-            "url": {"equals": amazon_url}
-        }
-    });
+            "url": {"equals": amazon_url(&isbn10)}
+        }));
+    }
+    match conditions.len() {
+        0 => None,
+        1 => conditions.pop(),
+        _ => Some(json!({"or": conditions})),
+    }
+}
+
+async fn query_database(
+    client: &reqwest::Client,
+    config: &Config,
+    filter: Value,
+    start_cursor: Option<&str>,
+) -> Result<Value> {
+    let mut query = json!({ "filter": filter });
+    if let Some(cursor) = start_cursor {
+        query["start_cursor"] = json!(cursor);
+    }
     let data: Value = client
         .post(format!(
             "https://api.notion.com/v1/databases/{}/query",
             config.notion_database_id
         ))
         .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", "2022-06-28")
+        .header("Notion-Version", NOTION_VERSION)
         .json(&query)
         .send()
         .await?
         .json()
         .await?;
+    if data["object"].as_str() == Some("error") {
+        let msg = data["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
+    }
+    Ok(data)
+}
+
+async fn find_duplicate_in_notion(
+    client: &reqwest::Client,
+    isbn13: &str,
+    has_isbn_property: bool,
+    config: &Config,
+) -> Result<Option<(String, Value)>> {
+    // ISBN 列がなく、979 始まりで AmazonURL も作れない場合は照合しようがない
+    let Some(filter) = build_duplicate_filter(isbn13, has_isbn_property) else {
+        return Ok(None);
+    };
+    let data = query_database(client, config, filter, None).await?;
     parse_duplicate_query_response(&data)
 }
 
@@ -567,7 +653,7 @@ async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Con
     let response: Value = client
         .post("https://api.notion.com/v1/pages")
         .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", "2022-06-28")
+        .header("Notion-Version", NOTION_VERSION)
         .json(&payload)
         .send()
         .await?
@@ -592,7 +678,7 @@ async fn update_notion_page(
     let response: Value = client
         .patch(format!("https://api.notion.com/v1/pages/{page_id}"))
         .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", "2022-06-28")
+        .header("Notion-Version", NOTION_VERSION)
         .json(&body)
         .send()
         .await?
@@ -636,6 +722,21 @@ fn build_archive_payload() -> Value {
 // Main processing
 // ============================================================
 
+/// DB の ISBN 列の有無を確認し、列がなければ案内を表示する。
+/// 取得に失敗した場合に「列なし」として続けると 979 始まりの ISBN を照合できないまま処理してしまうため、Err を返す
+async fn detect_isbn_property(client: &reqwest::Client, config: &Config) -> Result<bool> {
+    let has = database_has_isbn_property(client, config)
+        .await
+        .context("DB スキーマ取得に失敗")?;
+    if !has {
+        println!(
+            "\n  ℹ️  DB に「{ISBN_PROPERTY}」（テキスト）列がないため、ISBN は保存せず AmazonURL で照合します"
+        );
+        println!("     979 始まりの ISBN は照合できません。列を追加して --backfill-isbn を実行してください");
+    }
+    Ok(has)
+}
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -645,6 +746,15 @@ fn build_http_client() -> reqwest::Client {
 
 async fn process_deletes(isbn_list: Vec<String>, config: &Config, dry_run: bool, force: bool) {
     let client = build_http_client();
+
+    // 削除はドライランでも対象を探すため Notion に接続する
+    let has_isbn_property = match detect_isbn_property(&client, config).await {
+        Ok(has) => has,
+        Err(e) => {
+            println!("\n  ❌ {e:#} — 削除対象を特定できないため処理を中止します");
+            return;
+        }
+    };
 
     let total = isbn_list.len();
     let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
@@ -667,20 +777,21 @@ async fn process_deletes(isbn_list: Vec<String>, config: &Config, dry_run: bool,
             continue;
         };
 
-        let (page_id, props) = match find_duplicate_in_notion(&client, &isbn13, config).await {
-            Ok(Some(found)) => found,
-            Ok(None) => {
-                println!("  ⚠️  Notion に該当エントリなし (ISBN: {isbn13}) — スキップ");
-                skip += 1;
-                continue;
-            }
-            Err(e) => {
-                println!("  ❌ Notion 検索失敗: {e}");
-                fail += 1;
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                continue;
-            }
-        };
+        let (page_id, props) =
+            match find_duplicate_in_notion(&client, &isbn13, has_isbn_property, config).await {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    println!("  ⚠️  Notion に該当エントリなし (ISBN: {isbn13}) — スキップ");
+                    skip += 1;
+                    continue;
+                }
+                Err(e) => {
+                    println!("  ❌ Notion 検索失敗: {e}");
+                    fail += 1;
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    continue;
+                }
+            };
 
         print_existing_entry(&props);
 
@@ -731,6 +842,19 @@ async fn process_isbns(
 
     let total = isbn_list.len();
     let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
+
+    // ドライランでは Notion に接続しないため、ISBN 列ありの前提でペイロードを表示する
+    let has_isbn_property = if dry_run {
+        true
+    } else {
+        match detect_isbn_property(&client, config).await {
+            Ok(has) => has,
+            Err(e) => {
+                println!("\n  ❌ {e:#} — 重複判定ができないため処理を中止します");
+                return;
+            }
+        }
+    };
 
     if dry_run {
         println!("\n📚 {total}件のISBNを処理します（🔍 ドライラン: Notion には接続しません）\n");
@@ -791,7 +915,12 @@ async fn process_isbns(
             }
         }
 
-        let payload = build_notion_payload(&book, &config.notion_database_id, purchase_date);
+        let payload = build_notion_payload(
+            &book,
+            &config.notion_database_id,
+            purchase_date,
+            has_isbn_property,
+        );
         if dry_run {
             println!("  🔍 ドライラン: Notion 送信をスキップ");
             match serde_json::to_string_pretty(&payload) {
@@ -803,7 +932,7 @@ async fn process_isbns(
             let duplicate = if force {
                 None
             } else {
-                match find_duplicate_in_notion(&client, &isbn13, config).await {
+                match find_duplicate_in_notion(&client, &isbn13, has_isbn_property, config).await {
                     Ok(found) => found,
                     Err(e) => {
                         println!("  ❌ 重複チェック失敗（登録を中止）: {e}");
@@ -861,6 +990,95 @@ async fn process_isbns(
     }
 }
 
+/// ISBN 列が空で AmazonURL がある既存エントリに、AmazonURL から復元した ISBN-13 を書き込む
+async fn backfill_isbn(config: &Config, dry_run: bool) -> Result<()> {
+    let client = build_http_client();
+
+    if !database_has_isbn_property(&client, config).await? {
+        anyhow::bail!(
+            "DB に「{ISBN_PROPERTY}」（テキスト）列がありません。Notion で列を追加してから再実行してください"
+        );
+    }
+
+    // 更新でフィルタ結果が変わるため、先に全件を集めてから更新する
+    let filter = json!({
+        "and": [
+            {"property": ISBN_PROPERTY, "rich_text": {"is_empty": true}},
+            {"property": "AmazonURL", "url": {"is_not_empty": true}}
+        ]
+    });
+    let mut targets: Vec<(String, String, String)> = Vec::new(); // (page_id, title, url)
+    let mut cursor: Option<String> = None;
+    loop {
+        let data = query_database(&client, config, filter.clone(), cursor.as_deref()).await?;
+        for page in data["results"].as_array().into_iter().flatten() {
+            let Some(page_id) = page["id"].as_str() else {
+                continue;
+            };
+            let props = &page["properties"];
+            let title = props["名前"]["title"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(|t| t["plain_text"].as_str())
+                .unwrap_or("（不明）");
+            let url = props["AmazonURL"]["url"].as_str().unwrap_or("");
+            targets.push((page_id.to_string(), title.to_string(), url.to_string()));
+        }
+        if data["has_more"].as_bool() != Some(true) {
+            break;
+        }
+        cursor = data["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    let total = targets.len();
+    if dry_run {
+        println!("\n🔍 ISBN 埋め戻し（ドライラン: 更新しません）対象 {total}件\n");
+    } else {
+        println!("\n🔁 ISBN 埋め戻し 対象 {total}件\n");
+    }
+    println!("{}", "=".repeat(60));
+
+    let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
+    for (i, (page_id, title, url)) in targets.iter().enumerate() {
+        println!("\n[{}/{total}] {title}", i + 1);
+        let Some(isbn13) = isbn13_from_amazon_url(url) else {
+            println!("  ⚠️  AmazonURL から ISBN を復元できません ({url}) — スキップ");
+            skip += 1;
+            continue;
+        };
+        println!("  ISBN: {isbn13}");
+        if dry_run {
+            success += 1;
+            continue;
+        }
+        let payload = json!({
+            "properties": {
+                ISBN_PROPERTY: {"rich_text": [{"text": {"content": isbn13}}]}
+            }
+        });
+        match update_notion_page(&client, page_id, payload, config).await {
+            Ok(()) => {
+                println!("  ✅ 更新完了");
+                success += 1;
+            }
+            Err(e) => {
+                println!("  ❌ Notion APIエラー: {e}");
+                fail += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    println!("\n{}", "=".repeat(60));
+    let label = if dry_run { "更新予定" } else { "成功" };
+    println!("📊 結果: {label}={success}  スキップ={skip}  失敗={fail}  合計={total}");
+    Ok(())
+}
+
 fn validate_purchase_date(raw: &str) -> Result<(), String> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .map(|_| ())
@@ -908,6 +1126,28 @@ async fn main() {
     }
 
     isbn_list.extend(cli.isbn);
+
+    if cli.backfill_isbn {
+        // 埋め戻しはドライランでも Notion を読むため、認証情報を必須にする
+        let config = match Config::from_env(false) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        };
+        println!("書籍DB登録ツール（ISBN 埋め戻し）");
+        println!("   API Key: {}", mask_secret(&config.notion_api_key));
+        println!(
+            "   Database ID: {}",
+            mask_secret(&config.notion_database_id)
+        );
+        if let Err(e) = backfill_isbn(&config, cli.dry_run).await {
+            eprintln!("❌ {e}");
+            process::exit(1);
+        }
+        return;
+    }
 
     if isbn_list.is_empty() {
         use clap::CommandFactory;
@@ -1239,7 +1479,7 @@ mod tests {
 
     #[test]
     fn build_notion_payload_includes_all_fields() {
-        let payload = build_notion_payload(&full_book(), "db-id", "2026-03-15");
+        let payload = build_notion_payload(&full_book(), "db-id", "2026-03-15", false);
         let props = &payload["properties"];
 
         assert_eq!(payload["parent"]["database_id"], "db-id");
@@ -1268,7 +1508,7 @@ mod tests {
 
     #[test]
     fn build_notion_payload_omits_empty_fields() {
-        let payload = build_notion_payload(&empty_book(), "db-id", "");
+        let payload = build_notion_payload(&empty_book(), "db-id", "", false);
         let props = payload["properties"].as_object().unwrap();
 
         let keys: Vec<&str> = props.keys().map(String::as_str).collect();
@@ -1277,10 +1517,10 @@ mod tests {
 
     #[test]
     fn build_notion_payload_purchase_date_is_optional() {
-        let with_date = build_notion_payload(&full_book(), "db-id", "2026-03-15");
+        let with_date = build_notion_payload(&full_book(), "db-id", "2026-03-15", false);
         assert!(with_date["properties"].get("購入年月").is_some());
 
-        let without_date = build_notion_payload(&full_book(), "db-id", "");
+        let without_date = build_notion_payload(&full_book(), "db-id", "", false);
         assert!(without_date["properties"].get("購入年月").is_none());
     }
 
@@ -1378,5 +1618,72 @@ mod tests {
             book.cover,
             "https://images-na.ssl-images-amazon.com/images/P/4478039674.01.L.jpg"
         );
+    }
+
+    #[test]
+    fn duplicate_filter_uses_isbn_and_amazon_url_for_978() {
+        let filter = build_duplicate_filter("9784478039670", true).unwrap();
+        let conds = filter["or"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0]["rich_text"]["equals"], "9784478039670");
+        assert_eq!(
+            conds[1]["url"]["equals"],
+            "https://www.amazon.co.jp/dp/4478039674/"
+        );
+    }
+
+    #[test]
+    fn duplicate_filter_uses_isbn_only_for_979() {
+        let filter = build_duplicate_filter("9791032305690", true).unwrap();
+        assert_eq!(filter["property"], "ISBN");
+        assert_eq!(filter["rich_text"]["equals"], "9791032305690");
+    }
+
+    #[test]
+    fn duplicate_filter_falls_back_to_amazon_url_without_isbn_property() {
+        let filter = build_duplicate_filter("9784478039670", false).unwrap();
+        assert_eq!(filter["property"], "AmazonURL");
+        assert!(build_duplicate_filter("9791032305690", false).is_none());
+    }
+
+    #[test]
+    fn isbn13_from_amazon_url_restores_isbn13() {
+        assert_eq!(
+            isbn13_from_amazon_url("https://www.amazon.co.jp/dp/4478039674/"),
+            Some("9784478039670".into())
+        );
+        assert_eq!(
+            isbn13_from_amazon_url("https://www.amazon.co.jp/dp/4478039674"),
+            Some("9784478039670".into())
+        );
+        assert_eq!(
+            isbn13_from_amazon_url("https://www.amazon.co.jp/dp/B0ABCDEFGH/"),
+            None
+        );
+    }
+
+    fn sample_book(isbn: &str) -> Book {
+        Book {
+            title: "t".into(),
+            author: String::new(),
+            pubdate: String::new(),
+            cover: String::new(),
+            price: None,
+            description: String::new(),
+            isbn: isbn.into(),
+        }
+    }
+
+    #[test]
+    fn payload_includes_isbn_only_when_property_exists() {
+        let book = sample_book("9791032305690");
+        let with = build_notion_payload(&book, "db", "", true);
+        assert_eq!(
+            with["properties"]["ISBN"]["rich_text"][0]["text"]["content"],
+            "9791032305690"
+        );
+        assert!(with["properties"].get("AmazonURL").is_none());
+        let without = build_notion_payload(&book, "db", "", false);
+        assert!(without["properties"].get("ISBN").is_none());
     }
 }
