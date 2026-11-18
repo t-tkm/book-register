@@ -1345,7 +1345,7 @@ mod tests {
     }
 
     // ---------- parse_openbd ----------
-    // 著者名の整形は #19 で扱うため、ここでは著者名の検証は行わない
+    // 著者名の整形は extract_author / format_person_name のテスト（#19）で検証する
 
     #[test]
     fn parse_openbd_returns_none_without_title() {
