@@ -226,7 +226,7 @@ fn parse_openbd(data: &Value, tax_rate: f64) -> Option<Book> {
 
     Some(Book {
         title,
-        author: summary["author"].as_str().unwrap_or("").to_string(),
+        author: extract_author(onix, summary["author"].as_str().unwrap_or("")),
         pubdate: format_date(summary["pubdate"].as_str().unwrap_or("")),
         cover: get_book_cover_url(
             summary["isbn"].as_str().unwrap_or(""),
@@ -236,6 +236,82 @@ fn parse_openbd(data: &Value, tax_rate: f64) -> Option<Book> {
         price: extract_price(onix, tax_rate),
         description: extract_description(onix),
     })
+}
+
+/// 代表著者を1名抽出して整形する。
+/// ONIX の Contributor を優先し（役割コードがあれば著者 A01 を優先）、
+/// 取れなければ summary.author の先頭の人物を使う。
+fn extract_author(onix: &Value, summary_author: &str) -> String {
+    let contributors = &onix["DescriptiveDetail"]["Contributor"];
+    let mut list: Vec<&Value> = match contributors {
+        Value::Array(a) => a.iter().collect(),
+        Value::Object(_) => vec![contributors],
+        _ => Vec::new(),
+    };
+    list.retain(|c| {
+        c["PersonName"]["content"]
+            .as_str()
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    list.sort_by_key(|c| {
+        c["SequenceNumber"]
+            .as_str()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+
+    let has_role = |c: &&Value, code: &str| {
+        c["ContributorRole"]
+            .as_array()
+            .is_some_and(|roles| roles.iter().any(|r| r.as_str() == Some(code)))
+    };
+    let representative = list
+        .iter()
+        .find(|c| has_role(c, "A01"))
+        .or_else(|| list.first());
+
+    if let Some(c) = representative {
+        let name = format_person_name(c["PersonName"]["content"].as_str().unwrap_or(""));
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    summary_author
+        .split_whitespace()
+        .next()
+        .map(format_person_name)
+        .unwrap_or_default()
+}
+
+/// 「森, 博嗣, 1957-」→「森 博嗣」、「Harari, Yuval N., 1976-」→「Yuval N. Harari」
+fn format_person_name(raw: &str) -> String {
+    // 「藤森照信／著」のような役割表記を除去
+    let name = raw.split(['／', '/']).next().unwrap_or("");
+    let lifespan = Regex::new(r"^[0-9?？]{0,4}\s*[-‐－〜~]\s*[0-9?？]{0,4}$|^[0-9]{3,4}$").unwrap();
+    let parts: Vec<&str> = name
+        .split([',', '，', '、'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty() && !lifespan.is_match(p))
+        .collect();
+
+    match parts.as_slice() {
+        [] => String::new(),
+        [single] => single.to_string(),
+        [family, given @ ..] => {
+            let given = given.join(" ");
+            if is_japanese_name(family) {
+                format!("{family} {given}")
+            } else {
+                format!("{given} {family}")
+            }
+        }
+    }
+}
+
+fn is_japanese_name(s: &str) -> bool {
+    let cjk = Regex::new(r"[\p{Han}\p{Hiragana}\p{Katakana}]").unwrap();
+    cjk.is_match(s)
 }
 
 fn format_date(raw: &str) -> String {
@@ -718,6 +794,62 @@ mod tests {
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    #[test]
+    fn format_person_name_japanese_with_lifespan() {
+        assert_eq!(format_person_name("森,博嗣,1957-"), "森 博嗣");
+        assert_eq!(format_person_name("松田, 雄馬, 1982-"), "松田 雄馬");
+        assert_eq!(format_person_name("下山, 輝昌"), "下山 輝昌");
+    }
+
+    #[test]
+    fn format_person_name_western_reorders() {
+        assert_eq!(
+            format_person_name("Harari, Yuval N., 1976-"),
+            "Yuval N. Harari"
+        );
+        assert_eq!(
+            format_person_name("Rosling, Hans, 1948-2017"),
+            "Hans Rosling"
+        );
+    }
+
+    #[test]
+    fn format_person_name_strips_role_suffix() {
+        assert_eq!(format_person_name("藤森照信／著"), "藤森照信");
+        assert_eq!(format_person_name("藤森 照信"), "藤森 照信");
+    }
+
+    #[test]
+    fn extract_author_prefers_first_contributor_without_roles() {
+        let onix = json!({"DescriptiveDetail": {"Contributor": [
+            {"SequenceNumber": "2", "ContributorRole": [], "PersonName": {"content": "柴田, 裕之, 1959-"}},
+            {"SequenceNumber": "1", "ContributorRole": [], "PersonName": {"content": "Harari, Yuval N., 1976-"}}
+        ]}});
+        assert_eq!(
+            extract_author(&onix, "Harari,YuvalN.,1976- 柴田,裕之,1959-"),
+            "Yuval N. Harari"
+        );
+    }
+
+    #[test]
+    fn extract_author_prefers_author_role_over_translator() {
+        let onix = json!({"DescriptiveDetail": {"Contributor": [
+            {"SequenceNumber": "1", "ContributorRole": ["B06"], "PersonName": {"content": "設樂, 洋爾"}},
+            {"SequenceNumber": "2", "ContributorRole": ["A01"], "PersonName": {"content": "Enberg, Pekka"}}
+        ]}});
+        assert_eq!(
+            extract_author(&onix, "PekkaEnberg 設樂洋爾"),
+            "Pekka Enberg"
+        );
+    }
+
+    #[test]
+    fn extract_author_falls_back_to_summary() {
+        let onix = json!({});
+        assert_eq!(extract_author(&onix, "森,博嗣,1957-"), "森 博嗣");
+        assert_eq!(extract_author(&onix, ""), "");
     }
 
     #[test]
