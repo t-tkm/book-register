@@ -51,6 +51,8 @@ struct Cli {
 struct Config {
     notion_api_key: String,
     notion_database_id: String,
+    /// 登録先の data source ID。未設定（空）なら起動時に database ID から解決する
+    notion_data_source_id: String,
     tax_rate: f64,
 }
 
@@ -61,6 +63,10 @@ impl Config {
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .unwrap_or(1.10);
+        let data_source_id = std::env::var("NOTION_DATA_SOURCE_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
 
         if !require_notion {
             return Ok(Self {
@@ -69,9 +75,14 @@ impl Config {
                     .trim()
                     .to_string(),
                 notion_database_id: std::env::var("NOTION_DATABASE_ID")
-                    .unwrap_or_else(|_| "00000000-0000-0000-0000-000000000000".to_string())
+                    .unwrap_or_else(|_| DUMMY_ID.to_string())
                     .trim()
                     .to_string(),
+                notion_data_source_id: if data_source_id.is_empty() {
+                    DUMMY_ID.to_string()
+                } else {
+                    data_source_id
+                },
                 tax_rate,
             });
         }
@@ -84,6 +95,7 @@ impl Config {
         Ok(Self {
             notion_api_key: api_key,
             notion_database_id: database_id,
+            notion_data_source_id: data_source_id,
             tax_rate,
         })
     }
@@ -425,8 +437,95 @@ fn extract_description(onix: &Value) -> String {
 // Notion
 // ============================================================
 
-const NOTION_VERSION: &str = "2022-06-28";
+/// Notion API のベース URL
+const NOTION_API_BASE: &str = "https://api.notion.com/v1";
+
+/// Notion API のバージョン（全リクエストの `Notion-Version` ヘッダに使う）。
+/// 2025-09-03 以降はデータベース配下の data source 単位で query / スキーマ取得 / ページ作成を行う。
+const NOTION_VERSION: &str = "2026-03-11";
+
+/// ドライランで ID が未設定のときに使うダミー ID
+const DUMMY_ID: &str = "00000000-0000-0000-0000-000000000000";
+
 const ISBN_PROPERTY: &str = "ISBN";
+
+fn notion_request(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    path: &str,
+    config: &Config,
+) -> reqwest::RequestBuilder {
+    client
+        .request(method, format!("{NOTION_API_BASE}{path}"))
+        .header("Authorization", format!("Bearer {}", config.notion_api_key))
+        .header("Notion-Version", NOTION_VERSION)
+}
+
+fn notion_error(response: &Value) -> Option<String> {
+    (response["object"].as_str() == Some("error")).then(|| {
+        response["message"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string()
+    })
+}
+
+/// `GET /v1/databases/{id}` の応答から data source ID を選ぶ。
+/// data source が 1 つならそれを返し、0 個・複数ならエラーにする。
+fn select_data_source_id(database: &Value) -> Result<String, String> {
+    let sources = database["data_sources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    match sources.as_slice() {
+        [only] => only["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "❌ data source ID を取得できませんでした".to_string()),
+        [] => Err("❌ データベースに data source が見つかりません".to_string()),
+        many => {
+            let list: Vec<String> = many
+                .iter()
+                .map(|s| {
+                    format!(
+                        "     - {} ({})",
+                        s["name"].as_str().unwrap_or("名前なし"),
+                        s["id"].as_str().unwrap_or("?")
+                    )
+                })
+                .collect();
+            Err(format!(
+                "❌ データベースに data source が複数あります。.env の NOTION_DATA_SOURCE_ID で登録先を指定してください:\n{}",
+                list.join("\n")
+            ))
+        }
+    }
+}
+
+async fn resolve_data_source_id(
+    client: &reqwest::Client,
+    config: &Config,
+) -> Result<String, String> {
+    if !config.notion_data_source_id.is_empty() {
+        return Ok(config.notion_data_source_id.clone());
+    }
+    let database: Value = notion_request(
+        client,
+        reqwest::Method::GET,
+        &format!("/databases/{}", config.notion_database_id),
+        config,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("❌ Notion API に接続できません: {e}"))?
+    .json()
+    .await
+    .map_err(|e| format!("❌ Notion API の応答を解釈できません: {e}"))?;
+    if let Some(msg) = notion_error(&database) {
+        return Err(format!("❌ データベース情報の取得に失敗しました: {msg}"));
+    }
+    select_data_source_id(&database)
+}
 
 fn amazon_url(isbn10: &str) -> String {
     format!("https://www.amazon.co.jp/dp/{isbn10}/")
@@ -441,7 +540,7 @@ fn isbn13_from_amazon_url(url: &str) -> Option<String> {
 
 fn build_notion_payload(
     book: &Book,
-    database_id: &str,
+    data_source_id: &str,
     purchase_date: &str,
     include_isbn: bool,
 ) -> Value {
@@ -490,24 +589,26 @@ fn build_notion_payload(
         );
     }
 
-    json!({ "parent": {"database_id": database_id}, "properties": props })
+    json!({
+        "parent": {"type": "data_source_id", "data_source_id": data_source_id},
+        "properties": props
+    })
 }
 
-/// DB に ISBN（テキスト）プロパティがあるかを確認する
+/// data source に ISBN（テキスト）プロパティがあるかを確認する。
+/// 2025-09-03 以降、プロパティのスキーマは database ではなく data source 側にある
 async fn database_has_isbn_property(client: &reqwest::Client, config: &Config) -> Result<bool> {
-    let data: Value = client
-        .get(format!(
-            "https://api.notion.com/v1/databases/{}",
-            config.notion_database_id
-        ))
-        .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", NOTION_VERSION)
-        .send()
-        .await?
-        .json()
-        .await?;
-    if data["object"].as_str() == Some("error") {
-        let msg = data["message"].as_str().unwrap_or("Unknown error");
+    let data: Value = notion_request(
+        client,
+        reqwest::Method::GET,
+        &format!("/data_sources/{}", config.notion_data_source_id),
+        config,
+    )
+    .send()
+    .await?
+    .json()
+    .await?;
+    if let Some(msg) = notion_error(&data) {
         anyhow::bail!("{msg}");
     }
     Ok(data["properties"][ISBN_PROPERTY]["type"].as_str() == Some("rich_text"))
@@ -535,7 +636,7 @@ fn build_duplicate_filter(isbn13: &str, has_isbn_property: bool) -> Option<Value
     }
 }
 
-async fn query_database(
+async fn query_data_source(
     client: &reqwest::Client,
     config: &Config,
     filter: Value,
@@ -545,20 +646,18 @@ async fn query_database(
     if let Some(cursor) = start_cursor {
         query["start_cursor"] = json!(cursor);
     }
-    let data: Value = client
-        .post(format!(
-            "https://api.notion.com/v1/databases/{}/query",
-            config.notion_database_id
-        ))
-        .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", NOTION_VERSION)
-        .json(&query)
-        .send()
-        .await?
-        .json()
-        .await?;
-    if data["object"].as_str() == Some("error") {
-        let msg = data["message"].as_str().unwrap_or("Unknown error");
+    let data: Value = notion_request(
+        client,
+        reqwest::Method::POST,
+        &format!("/data_sources/{}/query", config.notion_data_source_id),
+        config,
+    )
+    .json(&query)
+    .send()
+    .await?
+    .json()
+    .await?;
+    if let Some(msg) = notion_error(&data) {
         anyhow::bail!("{msg}");
     }
     Ok(data)
@@ -574,15 +673,14 @@ async fn find_duplicate_in_notion(
     let Some(filter) = build_duplicate_filter(isbn13, has_isbn_property) else {
         return Ok(None);
     };
-    let data = query_database(client, config, filter, None).await?;
+    let data = query_data_source(client, config, filter, None).await?;
     parse_duplicate_query_response(&data)
 }
 
-/// Notion のデータベース検索レスポンスから、最初に一致したページの ID とプロパティを取り出す。
+/// Notion の data source 検索レスポンスから、最初に一致したページの ID とプロパティを取り出す。
 /// エラーレスポンスや想定外の形は「該当なし」と区別するため Err にする。
 fn parse_duplicate_query_response(data: &Value) -> Result<Option<(String, Value)>> {
-    if data["object"].as_str() == Some("error") {
-        let msg = data["message"].as_str().unwrap_or("Unknown error");
+    if let Some(msg) = notion_error(data) {
         anyhow::bail!("{msg}");
     }
     let Some(results) = data["results"].as_array() else {
@@ -650,18 +748,14 @@ fn prompt_yes_no(message: &str) -> bool {
 }
 
 async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Config) -> Result<()> {
-    let response: Value = client
-        .post("https://api.notion.com/v1/pages")
-        .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", NOTION_VERSION)
+    let response: Value = notion_request(client, reqwest::Method::POST, "/pages", config)
         .json(&payload)
         .send()
         .await?
         .json()
         .await?;
 
-    if response["object"].as_str() == Some("error") {
-        let msg = response["message"].as_str().unwrap_or("Unknown error");
+    if let Some(msg) = notion_error(&response) {
         anyhow::bail!("{msg}");
     }
     Ok(())
@@ -675,18 +769,19 @@ async fn update_notion_page(
 ) -> Result<()> {
     let properties = payload["properties"].clone();
     let body = json!({ "properties": properties });
-    let response: Value = client
-        .patch(format!("https://api.notion.com/v1/pages/{page_id}"))
-        .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", NOTION_VERSION)
-        .json(&body)
-        .send()
-        .await?
-        .json()
-        .await?;
+    let response: Value = notion_request(
+        client,
+        reqwest::Method::PATCH,
+        &format!("/pages/{page_id}"),
+        config,
+    )
+    .json(&body)
+    .send()
+    .await?
+    .json()
+    .await?;
 
-    if response["object"].as_str() == Some("error") {
-        let msg = response["message"].as_str().unwrap_or("Unknown error");
+    if let Some(msg) = notion_error(&response) {
         anyhow::bail!("{msg}");
     }
     Ok(())
@@ -697,25 +792,27 @@ async fn archive_notion_page(
     page_id: &str,
     config: &Config,
 ) -> Result<()> {
-    let response: Value = client
-        .patch(format!("https://api.notion.com/v1/pages/{page_id}"))
-        .header("Authorization", format!("Bearer {}", config.notion_api_key))
-        .header("Notion-Version", "2022-06-28")
-        .json(&build_archive_payload())
-        .send()
-        .await?
-        .json()
-        .await?;
+    let response: Value = notion_request(
+        client,
+        reqwest::Method::PATCH,
+        &format!("/pages/{page_id}"),
+        config,
+    )
+    .json(&build_archive_payload())
+    .send()
+    .await?
+    .json()
+    .await?;
 
-    if response["object"].as_str() == Some("error") {
-        let msg = response["message"].as_str().unwrap_or("Unknown error");
+    if let Some(msg) = notion_error(&response) {
         anyhow::bail!("{msg}");
     }
     Ok(())
 }
 
+/// ゴミ箱へ移動するペイロード（2026-03-11 で `archived` は `in_trash` に改名）
 fn build_archive_payload() -> Value {
-    json!({ "archived": true })
+    json!({ "in_trash": true })
 }
 
 // ============================================================
@@ -917,7 +1014,7 @@ async fn process_isbns(
 
         let payload = build_notion_payload(
             &book,
-            &config.notion_database_id,
+            &config.notion_data_source_id,
             purchase_date,
             has_isbn_property,
         );
@@ -1010,7 +1107,7 @@ async fn backfill_isbn(config: &Config, dry_run: bool) -> Result<()> {
     let mut targets: Vec<(String, String, String)> = Vec::new(); // (page_id, title, url)
     let mut cursor: Option<String> = None;
     loop {
-        let data = query_database(&client, config, filter.clone(), cursor.as_deref()).await?;
+        let data = query_data_source(&client, config, filter.clone(), cursor.as_deref()).await?;
         for page in data["results"].as_array().into_iter().flatten() {
             let Some(page_id) = page["id"].as_str() else {
                 continue;
@@ -1102,6 +1199,40 @@ fn mask_secret(value: &str) -> String {
     format!("***{suffix}")
 }
 
+/// 環境変数から設定を読み、Notion に接続するモードでは data source ID を解決する。失敗したら終了する
+async fn load_config(require_notion: bool) -> Config {
+    let mut config = match Config::from_env(require_notion) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+    if require_notion {
+        match resolve_data_source_id(&build_http_client(), &config).await {
+            Ok(id) => config.notion_data_source_id = id,
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        }
+    }
+    config
+}
+
+fn print_notion_target(config: &Config) {
+    println!("   API Key: {}", mask_secret(&config.notion_api_key));
+    println!(
+        "   Database ID: {}",
+        mask_secret(&config.notion_database_id)
+    );
+    println!(
+        "   Data Source ID: {}",
+        mask_secret(&config.notion_data_source_id)
+    );
+    println!("   Notion API: {NOTION_VERSION}");
+}
+
 #[tokio::main]
 async fn main() {
     let _ = dotenvy::dotenv();
@@ -1129,19 +1260,9 @@ async fn main() {
 
     if cli.backfill_isbn {
         // 埋め戻しはドライランでも Notion を読むため、認証情報を必須にする
-        let config = match Config::from_env(false) {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("{e}");
-                process::exit(1);
-            }
-        };
+        let config = load_config(true).await;
         println!("書籍DB登録ツール（ISBN 埋め戻し）");
-        println!("   API Key: {}", mask_secret(&config.notion_api_key));
-        println!(
-            "   Database ID: {}",
-            mask_secret(&config.notion_database_id)
-        );
+        print_notion_target(&config);
         if let Err(e) = backfill_isbn(&config, cli.dry_run).await {
             eprintln!("❌ {e}");
             process::exit(1);
@@ -1156,13 +1277,7 @@ async fn main() {
     }
 
     // 削除モードはドライランでも対象検索のため Notion に接続する
-    let config = match Config::from_env(!cli.dry_run || cli.delete) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("{e}");
-            process::exit(1);
-        }
-    };
+    let config = load_config(!cli.dry_run || cli.delete).await;
 
     let purchase_date = cli.date.unwrap_or_default();
     if !purchase_date.is_empty() {
@@ -1177,11 +1292,7 @@ async fn main() {
         if cli.dry_run {
             println!("   モード: ドライラン（対象の検索のみ行い、削除はしません）");
         }
-        println!("   API Key: {}", mask_secret(&config.notion_api_key));
-        println!(
-            "   Database ID: {}",
-            mask_secret(&config.notion_database_id)
-        );
+        print_notion_target(&config);
         process_deletes(isbn_list, &config, cli.dry_run, cli.force).await;
         return;
     }
@@ -1204,11 +1315,7 @@ async fn main() {
             }
         );
     } else {
-        println!("   API Key: {}", mask_secret(&config.notion_api_key));
-        println!(
-            "   Database ID: {}",
-            mask_secret(&config.notion_database_id)
-        );
+        print_notion_target(&config);
     }
     println!("   購入年月日: {purchase_date}");
 
@@ -1425,8 +1532,8 @@ mod tests {
     }
 
     #[test]
-    fn archive_payload_sets_archived_true() {
-        assert_eq!(build_archive_payload(), json!({"archived": true}));
+    fn archive_payload_sets_in_trash_true() {
+        assert_eq!(build_archive_payload(), json!({"in_trash": true}));
     }
 
     #[test]
@@ -1479,10 +1586,10 @@ mod tests {
 
     #[test]
     fn build_notion_payload_includes_all_fields() {
-        let payload = build_notion_payload(&full_book(), "db-id", "2026-03-15", false);
+        let payload = build_notion_payload(&full_book(), "ds-id", "2026-03-15", false);
         let props = &payload["properties"];
 
-        assert_eq!(payload["parent"]["database_id"], "db-id");
+        assert_eq!(payload["parent"]["data_source_id"], "ds-id");
         assert_eq!(props["名前"]["title"][0]["text"]["content"], "テスト書籍");
         assert_eq!(props["購入年月"]["date"]["start"], "2026-03-15");
         assert_eq!(
@@ -1508,7 +1615,7 @@ mod tests {
 
     #[test]
     fn build_notion_payload_omits_empty_fields() {
-        let payload = build_notion_payload(&empty_book(), "db-id", "", false);
+        let payload = build_notion_payload(&empty_book(), "ds-id", "", false);
         let props = payload["properties"].as_object().unwrap();
 
         let keys: Vec<&str> = props.keys().map(String::as_str).collect();
@@ -1517,10 +1624,10 @@ mod tests {
 
     #[test]
     fn build_notion_payload_purchase_date_is_optional() {
-        let with_date = build_notion_payload(&full_book(), "db-id", "2026-03-15", false);
+        let with_date = build_notion_payload(&full_book(), "ds-id", "2026-03-15", false);
         assert!(with_date["properties"].get("購入年月").is_some());
 
-        let without_date = build_notion_payload(&full_book(), "db-id", "", false);
+        let without_date = build_notion_payload(&full_book(), "ds-id", "", false);
         assert!(without_date["properties"].get("購入年月").is_none());
     }
 
@@ -1685,5 +1792,30 @@ mod tests {
         assert!(with["properties"].get("AmazonURL").is_none());
         let without = build_notion_payload(&book, "db", "", false);
         assert!(without["properties"].get("ISBN").is_none());
+    }
+
+    // ---------- data source ----------
+
+    #[test]
+    fn select_data_source_id_single() {
+        let db = json!({"data_sources": [{"id": "ds-1", "name": "本"}]});
+        assert_eq!(select_data_source_id(&db), Ok("ds-1".to_string()));
+    }
+
+    #[test]
+    fn select_data_source_id_rejects_none_or_many() {
+        assert!(select_data_source_id(&json!({"data_sources": []})).is_err());
+        let db = json!({"data_sources": [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}]});
+        let err = select_data_source_id(&db).unwrap_err();
+        assert!(err.contains("NOTION_DATA_SOURCE_ID") && err.contains("(b)"));
+    }
+
+    #[test]
+    fn payload_uses_data_source_parent() {
+        let payload = build_notion_payload(&full_book(), "ds-1", "", false);
+        assert_eq!(
+            payload["parent"],
+            json!({"type": "data_source_id", "data_source_id": "ds-1"})
+        );
     }
 }

@@ -84,7 +84,7 @@ book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
 
 `ISBN` 列がない DB でも動作するが、979 始まりの ISBN は重複を検出できないため、`ISBN`（テキスト）列の追加を推奨する。
 
-検索で Notion API がエラーを返した ISBN は登録せず「失敗」として集計する。起動時の DB スキーマ取得（`ISBN` 列の有無の確認）に失敗した場合は、正しく判定できないため処理全体を中止する。
+検索で Notion API がエラーを返した ISBN は登録せず「失敗」として集計する。起動時の data source ID の解決や DB スキーマ取得（`ISBN` 列の有無の確認）に失敗した場合は、正しく判定できないため処理全体を中止する。
 
 #### 既存エントリへの ISBN 埋め戻し
 
@@ -114,6 +114,7 @@ cp .env.example .env
 |--------|------|------|
 | `NOTION_API_KEY` | 必須 | Notion インテグレーションの API キー |
 | `NOTION_DATABASE_ID` | 必須 | 登録先データベースの ID（32文字） |
+| `NOTION_DATA_SOURCE_ID` | 省略可 | 登録先 data source の ID。省略時はデータベースから自動取得する。データベースに data source が複数ある場合は必須 |
 | `TAX_RATE` | 省略可 | 価格に乗じる税率（省略時: `1.10`） |
 
 > **注意**: `NOTION_API_KEY` は第三者に知られないよう管理してください。漏えいした場合は Notion の [My integrations](https://www.notion.so/my-integrations) から token を再発行してください。
@@ -198,13 +199,16 @@ OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
   ・通信エラー / HTTP エラー / JSON 解析失敗 → 失敗として集計
     │
     ▼
-Notion API
-  /v1/databases/{id}        ISBN 列の有無を確認（起動時 1 回）
-  /v1/databases/{id}/query  ISBN / AmazonURL で重複確認
-  /v1/pages                 新規登録（重複時は確認のうえ既存ページを更新）
+Notion API（Notion-Version: 2026-03-11）
+  GET   /v1/databases/{id}           data source ID を解決（起動時 1 回）
+  GET   /v1/data_sources/{id}        ISBN 列の有無を確認（起動時 1 回）
+  POST  /v1/data_sources/{id}/query  ISBN / AmazonURL で重複確認
+  POST  /v1/pages                    新規登録（重複時は確認のうえ PATCH /v1/pages/{id} で更新）
 ```
 
-`--delete` 時は OpenBD を使わず、`POST /v1/databases/{id}/query`（重複判定と同じ条件で検索）→ `PATCH /v1/pages/{page_id}`（`{"archived": true}`）でゴミ箱へ移動する。
+`--delete` 時は OpenBD を使わず、`POST /v1/data_sources/{id}/query`（重複判定と同じ条件で検索）→ `PATCH /v1/pages/{page_id}`（`{"in_trash": true}`）でゴミ箱へ移動する。`--backfill-isbn` も同じ data source に対して検索・更新する。
+
+API バージョンは `src/main.rs` の定数 `NOTION_VERSION` で一元管理している。2025-09-03 以降の API ではデータベース配下に data source があり、プロパティのスキーマ・検索・ページ作成は data source 単位で行う。
 
 ### フィールドマッピング
 
