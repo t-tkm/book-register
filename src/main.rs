@@ -332,8 +332,11 @@ async fn find_duplicate_in_notion(
     client: &reqwest::Client,
     isbn13: &str,
     config: &Config,
-) -> Option<(String, Value)> {
-    let isbn10 = isbn13_to_isbn10(isbn13)?;
+) -> Result<Option<(String, Value)>> {
+    // 979 始まりの ISBN は ISBN-10 に変換できず AmazonURL も登録しないため、照合しようがない
+    let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
+        return Ok(None);
+    };
     let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
     let query = json!({
         "filter": {
@@ -341,7 +344,7 @@ async fn find_duplicate_in_notion(
             "url": {"equals": amazon_url}
         }
     });
-    let response = client
+    let data: Value = client
         .post(format!(
             "https://api.notion.com/v1/databases/{}/query",
             config.notion_database_id
@@ -350,15 +353,29 @@ async fn find_duplicate_in_notion(
         .header("Notion-Version", "2022-06-28")
         .json(&query)
         .send()
-        .await
-        .ok()?;
-    let data: Value = response.json().await.ok()?;
+        .await?
+        .json()
+        .await?;
+    parse_duplicate_query_response(&data)
+}
+
+/// Notion のデータベース検索レスポンスから、最初に一致したページの ID とプロパティを取り出す。
+/// エラーレスポンスや想定外の形は「該当なし」と区別するため Err にする。
+fn parse_duplicate_query_response(data: &Value) -> Result<Option<(String, Value)>> {
     if data["object"].as_str() == Some("error") {
-        return None;
+        let msg = data["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
     }
-    let page = data["results"].as_array()?.first()?;
-    let page_id = page["id"].as_str()?.to_string();
-    Some((page_id, page["properties"].clone()))
+    let Some(results) = data["results"].as_array() else {
+        anyhow::bail!("検索結果の形式が不正です");
+    };
+    let Some(page) = results.first() else {
+        return Ok(None);
+    };
+    let Some(page_id) = page["id"].as_str() else {
+        anyhow::bail!("検索結果にページ ID がありません");
+    };
+    Ok(Some((page_id.to_string(), page["properties"].clone())))
 }
 
 fn print_existing_entry(props: &Value) {
@@ -528,7 +545,15 @@ async fn process_isbns(
             let duplicate = if force {
                 None
             } else {
-                find_duplicate_in_notion(&client, &isbn13, config).await
+                match find_duplicate_in_notion(&client, &isbn13, config).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        println!("  ❌ 重複チェック失敗（登録を中止）: {e}");
+                        fail += 1;
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        continue;
+                    }
+                }
             };
 
             let result = match duplicate {
@@ -718,6 +743,40 @@ mod tests {
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    #[test]
+    fn duplicate_response_with_match_returns_page() {
+        let data = json!({
+            "object": "list",
+            "results": [{"id": "page-1", "properties": {"名前": {}}}]
+        });
+        let (id, props) = parse_duplicate_query_response(&data).unwrap().unwrap();
+        assert_eq!(id, "page-1");
+        assert!(props.get("名前").is_some());
+    }
+
+    #[test]
+    fn duplicate_response_without_match_returns_none() {
+        let data = json!({"object": "list", "results": []});
+        assert!(parse_duplicate_query_response(&data).unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_response_error_is_err() {
+        let data = json!({
+            "object": "error",
+            "status": 429,
+            "code": "rate_limited",
+            "message": "Rate limited"
+        });
+        let err = parse_duplicate_query_response(&data).unwrap_err();
+        assert_eq!(err.to_string(), "Rate limited");
+    }
+
+    #[test]
+    fn duplicate_response_unexpected_shape_is_err() {
+        assert!(parse_duplicate_query_response(&json!({})).is_err());
     }
 
     #[test]
