@@ -57,7 +57,7 @@ book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
 
 | プロパティ名 | 型       | 自動入力 |
 |------------|---------|:------:|
-| 画像        | URL      | ✅ |
+| 画像        | ファイル&メディア | ✅ |
 | 名前        | タイトル  | ✅ |
 | 代表著者    | テキスト  | ✅ |
 | 価格        | 数値     | ✅ |
@@ -97,14 +97,19 @@ cp .env.example .env
 
 | OS      | ファイル名の例                                      |
 |---------|---------------------------------------------------|
-| macOS   | `book_register-v0.x.x-aarch64-apple-darwin.tar.gz`（Apple Silicon）<br>`book_register-v0.x.x-x86_64-apple-darwin.tar.gz`（Intel） |
-| Linux   | `book_register-v0.x.x-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS   | `book_register-v0.x.x-aarch64-apple-darwin.zip`（Apple Silicon）<br>`book_register-v0.x.x-x86_64-apple-darwin.zip`（Intel） |
+| Linux   | `book_register-v0.x.x-x86_64-unknown-linux-gnu.tar.gz`（x86_64）<br>`book_register-v0.x.x-aarch64-unknown-linux-gnu.tar.gz`（ARM64） |
 | Windows | `book_register-v0.x.x-x86_64-pc-windows-msvc.zip` |
 
 #### macOS / Linux: 展開と実行権限の付与
 
 ```sh
+# macOS（zip）
+unzip book_register-*.zip
+
+# Linux（tar.gz）
 tar xzf book_register-*.tar.gz
+
 chmod +x book_register
 ```
 
@@ -179,7 +184,7 @@ Notion API  https://api.notion.com/v1/pages
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUI で入力）|
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount` に `TAX_RATE` を乗じた税込価格 |
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
-| 画像            | URL      | `summary.cover`                                     |
+| 画像            | ファイル&メディア | `summary.cover`（外部 URL として添付）                |
 
 ---
 
