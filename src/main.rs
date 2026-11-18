@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     // ---------- extract_price ----------
-    // PriceType による選択は #18 で扱うため、ここでは現行仕様（最初の数値 PriceAmount）を検証する
+    // PriceType ごとの選択は上の extract_price_* テスト（#18）で検証済み。ここでは形式・税率・端数を検証する
 
     fn onix_with_price(price: Value) -> Value {
         json!({ "ProductSupply": { "SupplyDetail": { "Price": price } } })
@@ -1203,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_price_returns_none_without_price() {
+    fn extract_price_returns_none_for_empty_or_invalid_amount() {
         assert_eq!(extract_price(&json!({}), 1.10), None);
         assert_eq!(extract_price(&onix_with_price(json!([])), 1.10), None);
         assert_eq!(
