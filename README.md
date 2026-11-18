@@ -154,9 +154,25 @@ Notion API  https://api.notion.com/v1/pages
 | 出版月          | テキスト  | `summary.pubdate`（`YYYYMMDD` / `YYYYMM` → `YYYYMM` に変換）|
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合は Notion で手動入力） |
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUI で入力）|
-| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount` に `TAX_RATE` を乗じた税込価格 |
+| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[]` から税込価格を算出（下記「価格の決め方」参照） |
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | URL      | `summary.cover`                                     |
+
+### 価格の決め方
+
+`Price[]` に複数の価格がある場合、`PriceType`（ONIX コードリスト 58）を見て次の優先順で 1 つ選ぶ。
+
+| 優先 | PriceType | 意味 | 計算 |
+|:---:|-----------|------|------|
+| 1 | `03` | 定価（税抜） | `PriceAmount × TAX_RATE` |
+| 2 | `01` | 希望小売価格（税抜） | `PriceAmount × TAX_RATE` |
+| 3 | `04` | 定価（税込） | `PriceAmount` をそのまま使う |
+| 4 | `02` | 希望小売価格（税込） | `PriceAmount` をそのまま使う |
+| 5 | なし | 種別の指定がないデータ | 税抜とみなし `PriceAmount × TAX_RATE` |
+
+- 特価（`11` など）や上の表にない種別は使わない。該当する価格がなければ価格は空で登録する
+- `CurrencyCode` が `JPY` 以外の価格は使わない
+- 税率を掛けたときの 1 円未満は**四捨五入**する（例: 1,235 円 × 1.10 = 1,358.5 → 1,359 円）
 
 ---
 

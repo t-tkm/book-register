@@ -246,6 +246,21 @@ fn format_date(raw: &str) -> String {
     }
 }
 
+/// ONIX PriceType の優先順位と、税抜価格かどうか。
+/// 上ほど優先する。`None` は PriceType が無いデータ（従来互換で税抜とみなす）。
+const PRICE_TYPE_PRIORITY: &[(Option<&str>, bool)] = &[
+    (Some("03"), true),  // 定価（税抜） Fixed retail price excluding tax
+    (Some("01"), true),  // 希望小売価格（税抜） RRP excluding tax
+    (Some("04"), false), // 定価（税込） Fixed retail price including tax
+    (Some("02"), false), // 希望小売価格（税込） RRP including tax
+    (None, true),        // PriceType 未設定
+];
+
+/// 税込価格（円）を返す。
+///
+/// - `PRICE_TYPE_PRIORITY` の順に価格を選ぶ。特価（11 など）や上記以外の種別は使わない
+/// - `CurrencyCode` が指定されていて `JPY` 以外のものは除外する
+/// - 税抜価格には `tax_rate` を掛け、1円未満は四捨五入する。税込価格はそのまま使う
 fn extract_price(onix: &Value, tax_rate: f64) -> Option<u32> {
     let prices = &onix["ProductSupply"]["SupplyDetail"]["Price"];
     let list: Vec<&Value> = match prices {
@@ -253,9 +268,23 @@ fn extract_price(onix: &Value, tax_rate: f64) -> Option<u32> {
         Value::Object(_) => vec![prices],
         _ => return None,
     };
-    list.iter()
-        .find_map(|p| p["PriceAmount"].as_str()?.parse::<u32>().ok())
-        .map(|price_excl| (price_excl as f64 * tax_rate).round() as u32)
+    let candidates: Vec<(Option<&str>, f64)> = list
+        .iter()
+        .filter(|p| p["CurrencyCode"].as_str().is_none_or(|c| c == "JPY"))
+        .filter_map(|p| {
+            let amount = p["PriceAmount"].as_str()?.trim().parse::<f64>().ok()?;
+            (amount.is_finite() && amount >= 0.0).then_some((p["PriceType"].as_str(), amount))
+        })
+        .collect();
+    PRICE_TYPE_PRIORITY.iter().find_map(|(ty, excl_tax)| {
+        let (_, amount) = candidates.iter().find(|(t, _)| t == ty)?;
+        let price = if *excl_tax {
+            amount * tax_rate
+        } else {
+            *amount
+        };
+        Some(price.round() as u32)
+    })
 }
 
 fn extract_description(onix: &Value) -> String {
@@ -718,6 +747,54 @@ mod tests {
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    fn onix_prices(prices: Value) -> Value {
+        json!({ "ProductSupply": { "SupplyDetail": { "Price": prices } } })
+    }
+
+    #[test]
+    fn extract_price_prefers_fixed_price_excluding_tax() {
+        let onix = onix_prices(json!([
+            {"PriceType": "11", "CurrencyCode": "JPY", "PriceAmount": "980"},
+            {"PriceType": "03", "CurrencyCode": "JPY", "PriceAmount": "1500"},
+        ]));
+        assert_eq!(extract_price(&onix, 1.10), Some(1650));
+    }
+
+    #[test]
+    fn extract_price_uses_tax_included_price_as_is() {
+        let onix = onix_prices(json!({"PriceType": "04", "PriceAmount": "1650"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1650));
+    }
+
+    #[test]
+    fn extract_price_without_price_type_is_treated_as_excluding_tax() {
+        let onix = onix_prices(json!({"PriceAmount": "1000"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1100));
+    }
+
+    #[test]
+    fn extract_price_ignores_special_and_foreign_prices() {
+        let onix = onix_prices(json!([
+            {"PriceType": "11", "PriceAmount": "980"},
+            {"PriceType": "03", "CurrencyCode": "USD", "PriceAmount": "20"},
+        ]));
+        assert_eq!(extract_price(&onix, 1.10), None);
+    }
+
+    #[test]
+    fn extract_price_rounds_half_up() {
+        // 1234 * 1.10 = 1357.4 → 1357, 1235 * 1.10 = 1358.5 → 1359
+        let onix = onix_prices(json!({"PriceType": "03", "PriceAmount": "1234"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1357));
+        let onix = onix_prices(json!({"PriceType": "03", "PriceAmount": "1235"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1359));
+    }
+
+    #[test]
+    fn extract_price_returns_none_without_price() {
+        assert_eq!(extract_price(&json!({}), 1.10), None);
     }
 
     #[test]
