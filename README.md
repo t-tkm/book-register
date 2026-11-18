@@ -16,9 +16,28 @@ book_register -f isbn_list.txt
 
 # ドライラン（Notion には送らず、取得結果と送信予定 JSON を標準出力のみ）
 book_register --dry-run 9784478039670
+
+# 登録済みエントリを削除（Notion のゴミ箱へ移動）
+book_register --delete 9784478039670
 ```
 
 対応 ISBN 形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
+
+登録前に AmazonURL で重複をチェックし、既存エントリがあれば上書きするか確認します。重複チェックで Notion API がエラーを返した場合（レート制限・権限不足など）は登録せず「失敗」として数えます。
+
+### 登録済みエントリの削除
+
+`--delete` を付けると、指定した ISBN のエントリを Notion から探し、内容を表示して `[y/N]` で確認した後にゴミ箱へ移動する。ゴミ箱からは Notion の GUI で復元できる。
+
+```sh
+book_register --delete 9784478039670              # 確認してから削除
+book_register --delete --dry-run 9784478039670    # 削除対象を表示するだけ（削除しない）
+book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
+```
+
+- 削除対象は `AmazonURL` プロパティ（ISBN から生成）で特定する。該当エントリがない ISBN はスキップ、検索で Notion API がエラーを返した ISBN は失敗として集計する
+- `--dry-run` でも対象を探すため Notion に接続する（`NOTION_API_KEY` / `NOTION_DATABASE_ID` が必要）
+- `--date` とは併用できない
 
 ---
 
@@ -38,7 +57,7 @@ book_register --dry-run 9784478039670
 
 | プロパティ名 | 型       | 自動入力 |
 |------------|---------|:------:|
-| 画像        | URL      | ✅ |
+| 画像        | ファイル&メディア | ✅ |
 | 名前        | タイトル  | ✅ |
 | 代表著者    | テキスト  | ✅ |
 | 価格        | 数値     | ✅ |
@@ -78,14 +97,19 @@ cp .env.example .env
 
 | OS      | ファイル名の例                                      |
 |---------|---------------------------------------------------|
-| macOS   | `book_register-v0.x.x-aarch64-apple-darwin.tar.gz`（Apple Silicon）<br>`book_register-v0.x.x-x86_64-apple-darwin.tar.gz`（Intel） |
-| Linux   | `book_register-v0.x.x-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS   | `book_register-v0.x.x-aarch64-apple-darwin.zip`（Apple Silicon）<br>`book_register-v0.x.x-x86_64-apple-darwin.zip`（Intel） |
+| Linux   | `book_register-v0.x.x-x86_64-unknown-linux-gnu.tar.gz`（x86_64）<br>`book_register-v0.x.x-aarch64-unknown-linux-gnu.tar.gz`（ARM64） |
 | Windows | `book_register-v0.x.x-x86_64-pc-windows-msvc.zip` |
 
 #### macOS / Linux: 展開と実行権限の付与
 
 ```sh
+# macOS（zip）
+unzip book_register-*.zip
+
+# Linux（tar.gz）
 tar xzf book_register-*.tar.gz
+
 chmod +x book_register
 ```
 
@@ -139,11 +163,15 @@ ISBN 正規化
     ▼
 OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
   日本の書籍流通データベース（無料・登録不要）
+  ・該当データなし → スキップとして集計
+  ・通信エラー / HTTP エラー / JSON 解析失敗 → 失敗として集計
     │
     ▼
 Notion API  https://api.notion.com/v1/pages
   取得した書誌情報をページとして挿入
 ```
+
+`--delete` 時は OpenBD を使わず、`POST /v1/databases/{id}/query`（AmazonURL で検索）→ `PATCH /v1/pages/{page_id}`（`{"archived": true}`）でゴミ箱へ移動する。
 
 ### フィールドマッピング
 
@@ -154,9 +182,25 @@ Notion API  https://api.notion.com/v1/pages
 | 出版月          | テキスト  | `summary.pubdate`（`YYYYMMDD` / `YYYYMM` → `YYYYMM` に変換）|
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合は Notion で手動入力） |
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUI で入力）|
-| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[].PriceAmount` に `TAX_RATE` を乗じた税込価格 |
+| 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[]` から税込価格を算出（下記「価格の決め方」参照） |
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
-| 画像            | URL      | `summary.cover`                                     |
+| 画像            | ファイル&メディア | `summary.cover`（外部 URL として添付）                |
+
+### 価格の決め方
+
+`Price[]` に複数の価格がある場合、`PriceType`（ONIX コードリスト 58）を見て次の優先順で 1 つ選ぶ。
+
+| 優先 | PriceType | 意味 | 計算 |
+|:---:|-----------|------|------|
+| 1 | `03` | 定価（税抜） | `PriceAmount × TAX_RATE` |
+| 2 | `01` | 希望小売価格（税抜） | `PriceAmount × TAX_RATE` |
+| 3 | `04` | 定価（税込） | `PriceAmount` をそのまま使う |
+| 4 | `02` | 希望小売価格（税込） | `PriceAmount` をそのまま使う |
+| 5 | なし | 種別の指定がないデータ | 税抜とみなし `PriceAmount × TAX_RATE` |
+
+- 特価（`11` など）や上の表にない種別は使わない。該当する価格がなければ価格は空で登録する
+- `CurrencyCode` が `JPY` 以外の価格は使わない
+- 税率を掛けたときの 1 円未満は**四捨五入**する（例: 1,235 円 × 1.10 = 1,358.5 → 1,359 円）
 
 ---
 
