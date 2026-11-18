@@ -16,9 +16,26 @@ book_register -f isbn_list.txt
 
 # ドライラン（Notion には送らず、取得結果と送信予定 JSON を標準出力のみ）
 book_register --dry-run 9784478039670
+
+# 登録済みエントリを削除（Notion のゴミ箱へ移動）
+book_register --delete 9784478039670
 ```
 
 対応 ISBN 形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
+
+### 登録済みエントリの削除
+
+`--delete` を付けると、指定した ISBN のエントリを Notion から探し、内容を表示して `[y/N]` で確認した後にゴミ箱へ移動する。ゴミ箱からは Notion の GUI で復元できる。
+
+```sh
+book_register --delete 9784478039670              # 確認してから削除
+book_register --delete --dry-run 9784478039670    # 削除対象を表示するだけ（削除しない）
+book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
+```
+
+- 削除対象は `AmazonURL` プロパティ（ISBN から生成）で特定する。該当エントリがない ISBN はスキップとして集計する
+- `--dry-run` でも対象を探すため Notion に接続する（`NOTION_API_KEY` / `NOTION_DATABASE_ID` が必要）
+- `--date` とは併用できない
 
 ---
 
@@ -144,6 +161,8 @@ OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
 Notion API  https://api.notion.com/v1/pages
   取得した書誌情報をページとして挿入
 ```
+
+`--delete` 時は OpenBD を使わず、`POST /v1/databases/{id}/query`（AmazonURL で検索）→ `PATCH /v1/pages/{page_id}`（`{"archived": true}`）でゴミ箱へ移動する。
 
 ### フィールドマッピング
 
