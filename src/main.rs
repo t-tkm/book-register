@@ -1,6 +1,6 @@
 use std::{path::Path, process, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::Parser;
 use regex::Regex;
@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 #[derive(Parser)]
 #[command(
     about = "ISBN → OpenBD → Notion 書籍DB登録",
-    after_help = "例: book_register 9784478039670 9784798067278"
+    after_help = "例: book_register 9784478039670 9784798067278\n    book_register --delete 9784478039670"
 )]
 struct Cli {
     /// ISBN-10 または ISBN-13（複数指定可）
@@ -23,17 +23,21 @@ struct Cli {
     #[arg(short, long)]
     file: Option<String>,
 
-    /// 購入年月日（YYYY-MM-DD、省略時は今日）
+    /// 購入年月日（YYYY-MM-DD、省略時は空で登録）
     #[arg(short, long, value_name = "YYYY-MM-DD")]
     date: Option<String>,
 
-    /// Notion に送信せず、OpenBDの取得結果と送信予定 JSON を標準出力のみに出す
+    /// Notion に送信せず、OpenBDの取得結果と送信予定 JSON を標準出力のみに出す（--delete 時は削除対象の表示のみ）
     #[arg(long = "dry-run")]
     dry_run: bool,
 
-    /// 重複確認をスキップして強制登録する
+    /// 重複確認をスキップして強制登録する（--delete 時は削除確認を省略）
     #[arg(long)]
     force: bool,
+
+    /// 指定 ISBN の登録済みエントリを削除する（Notion のゴミ箱へ移動）
+    #[arg(long, conflicts_with = "date")]
+    delete: bool,
 }
 
 // ============================================================
@@ -47,13 +51,14 @@ struct Config {
 }
 
 impl Config {
-    fn from_env(dry_run: bool) -> Result<Self, String> {
+    /// `require_notion` が false のとき（登録のドライラン）は API キー等を省略可能にする
+    fn from_env(require_notion: bool) -> Result<Self, String> {
         let tax_rate = std::env::var("TAX_RATE")
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())
             .unwrap_or(1.10);
 
-        if dry_run {
+        if !require_notion {
             return Ok(Self {
                 notion_api_key: std::env::var("NOTION_API_KEY")
                     .unwrap_or_default()
@@ -205,14 +210,37 @@ fn isbn13_to_isbn10(isbn13: &str) -> Option<String> {
 // OpenBD
 // ============================================================
 
-async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Option<Book> {
+/// OpenBD から書誌情報を取得する。
+///
+/// - `Ok(Some(book))`: 取得成功
+/// - `Ok(None)`: OpenBD に該当データなし
+/// - `Err(_)`: 通信エラー・HTTP エラー・レスポンス解析失敗
+async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Result<Option<Book>> {
     let url = format!("https://api.openbd.jp/v1/get?isbn={isbn13}");
-    let data: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-    let entry = data.get(0)?;
+    let data: Value = client
+        .get(&url)
+        .send()
+        .await
+        .context("通信に失敗")?
+        .error_for_status()
+        .context("HTTP エラー")?
+        .json()
+        .await
+        .context("レスポンスの JSON 解析に失敗")?;
+    parse_openbd_response(&data, tax_rate)
+}
+
+/// OpenBD のレスポンス（配列）を解釈する。該当なしは `null` 要素で返る。
+fn parse_openbd_response(data: &Value, tax_rate: f64) -> Result<Option<Book>> {
+    let entry = data
+        .as_array()
+        .context("想定外のレスポンス形式（配列ではない）")?
+        .first()
+        .context("想定外のレスポンス形式（空の配列）")?;
     if entry.is_null() {
-        return None;
+        return Ok(None);
     }
-    parse_openbd(entry, tax_rate)
+    Ok(parse_openbd(entry, tax_rate))
 }
 
 fn parse_openbd(data: &Value, tax_rate: f64) -> Option<Book> {
@@ -246,6 +274,21 @@ fn format_date(raw: &str) -> String {
     }
 }
 
+/// ONIX PriceType の優先順位と、税抜価格かどうか。
+/// 上ほど優先する。`None` は PriceType が無いデータ（従来互換で税抜とみなす）。
+const PRICE_TYPE_PRIORITY: &[(Option<&str>, bool)] = &[
+    (Some("03"), true),  // 定価（税抜） Fixed retail price excluding tax
+    (Some("01"), true),  // 希望小売価格（税抜） RRP excluding tax
+    (Some("04"), false), // 定価（税込） Fixed retail price including tax
+    (Some("02"), false), // 希望小売価格（税込） RRP including tax
+    (None, true),        // PriceType 未設定
+];
+
+/// 税込価格（円）を返す。
+///
+/// - `PRICE_TYPE_PRIORITY` の順に価格を選ぶ。特価（11 など）や上記以外の種別は使わない
+/// - `CurrencyCode` が指定されていて `JPY` 以外のものは除外する
+/// - 税抜価格には `tax_rate` を掛け、1円未満は四捨五入する。税込価格はそのまま使う
 fn extract_price(onix: &Value, tax_rate: f64) -> Option<u32> {
     let prices = &onix["ProductSupply"]["SupplyDetail"]["Price"];
     let list: Vec<&Value> = match prices {
@@ -253,9 +296,23 @@ fn extract_price(onix: &Value, tax_rate: f64) -> Option<u32> {
         Value::Object(_) => vec![prices],
         _ => return None,
     };
-    list.iter()
-        .find_map(|p| p["PriceAmount"].as_str()?.parse::<u32>().ok())
-        .map(|price_excl| (price_excl as f64 * tax_rate).round() as u32)
+    let candidates: Vec<(Option<&str>, f64)> = list
+        .iter()
+        .filter(|p| p["CurrencyCode"].as_str().is_none_or(|c| c == "JPY"))
+        .filter_map(|p| {
+            let amount = p["PriceAmount"].as_str()?.trim().parse::<f64>().ok()?;
+            (amount.is_finite() && amount >= 0.0).then_some((p["PriceType"].as_str(), amount))
+        })
+        .collect();
+    PRICE_TYPE_PRIORITY.iter().find_map(|(ty, excl_tax)| {
+        let (_, amount) = candidates.iter().find(|(t, _)| t == ty)?;
+        let price = if *excl_tax {
+            amount * tax_rate
+        } else {
+            *amount
+        };
+        Some(price.round() as u32)
+    })
 }
 
 fn extract_description(onix: &Value) -> String {
@@ -332,8 +389,11 @@ async fn find_duplicate_in_notion(
     client: &reqwest::Client,
     isbn13: &str,
     config: &Config,
-) -> Option<(String, Value)> {
-    let isbn10 = isbn13_to_isbn10(isbn13)?;
+) -> Result<Option<(String, Value)>> {
+    // 979 始まりの ISBN は ISBN-10 に変換できず AmazonURL も登録しないため、照合しようがない
+    let Some(isbn10) = isbn13_to_isbn10(isbn13) else {
+        return Ok(None);
+    };
     let amazon_url = format!("https://www.amazon.co.jp/dp/{isbn10}/");
     let query = json!({
         "filter": {
@@ -341,7 +401,7 @@ async fn find_duplicate_in_notion(
             "url": {"equals": amazon_url}
         }
     });
-    let response = client
+    let data: Value = client
         .post(format!(
             "https://api.notion.com/v1/databases/{}/query",
             config.notion_database_id
@@ -350,15 +410,29 @@ async fn find_duplicate_in_notion(
         .header("Notion-Version", "2022-06-28")
         .json(&query)
         .send()
-        .await
-        .ok()?;
-    let data: Value = response.json().await.ok()?;
+        .await?
+        .json()
+        .await?;
+    parse_duplicate_query_response(&data)
+}
+
+/// Notion のデータベース検索レスポンスから、最初に一致したページの ID とプロパティを取り出す。
+/// エラーレスポンスや想定外の形は「該当なし」と区別するため Err にする。
+fn parse_duplicate_query_response(data: &Value) -> Result<Option<(String, Value)>> {
     if data["object"].as_str() == Some("error") {
-        return None;
+        let msg = data["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
     }
-    let page = data["results"].as_array()?.first()?;
-    let page_id = page["id"].as_str()?.to_string();
-    Some((page_id, page["properties"].clone()))
+    let Some(results) = data["results"].as_array() else {
+        anyhow::bail!("検索結果の形式が不正です");
+    };
+    let Some(page) = results.first() else {
+        return Ok(None);
+    };
+    let Some(page_id) = page["id"].as_str() else {
+        anyhow::bail!("検索結果にページ ID がありません");
+    };
+    Ok(Some((page_id.to_string(), page["properties"].clone())))
 }
 
 fn print_existing_entry(props: &Value) {
@@ -395,8 +469,18 @@ fn print_existing_entry(props: &Value) {
 }
 
 fn prompt_overwrite(title: &str) -> bool {
+    prompt_yes_no(&format!(
+        "上記エントリを「{title}」の新しいデータで上書きしますか？"
+    ))
+}
+
+fn prompt_delete() -> bool {
+    prompt_yes_no("上記エントリを削除（Notion のゴミ箱へ移動）しますか？")
+}
+
+fn prompt_yes_no(message: &str) -> bool {
     use std::io::{self, Write};
-    print!("  ⚠️  上記エントリを「{title}」の新しいデータで上書きしますか？ [y/N]: ");
+    print!("  ⚠️  {message} [y/N]: ");
     io::stdout().flush().ok();
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
@@ -446,9 +530,119 @@ async fn update_notion_page(
     Ok(())
 }
 
+async fn archive_notion_page(
+    client: &reqwest::Client,
+    page_id: &str,
+    config: &Config,
+) -> Result<()> {
+    let response: Value = client
+        .patch(format!("https://api.notion.com/v1/pages/{page_id}"))
+        .header("Authorization", format!("Bearer {}", config.notion_api_key))
+        .header("Notion-Version", "2022-06-28")
+        .json(&build_archive_payload())
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if response["object"].as_str() == Some("error") {
+        let msg = response["message"].as_str().unwrap_or("Unknown error");
+        anyhow::bail!("{msg}");
+    }
+    Ok(())
+}
+
+fn build_archive_payload() -> Value {
+    json!({ "archived": true })
+}
+
 // ============================================================
 // Main processing
 // ============================================================
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("HTTPクライアントの初期化に失敗")
+}
+
+async fn process_deletes(isbn_list: Vec<String>, config: &Config, dry_run: bool, force: bool) {
+    let client = build_http_client();
+
+    let total = isbn_list.len();
+    let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
+
+    if dry_run {
+        println!(
+            "\n🗑️  {total}件のISBNの削除対象を確認します（🔍 ドライラン: 削除は行いません）\n"
+        );
+    } else {
+        println!("\n🗑️  {total}件のISBNを削除します\n");
+    }
+    println!("{}", "=".repeat(60));
+
+    for (i, raw) in isbn_list.iter().enumerate() {
+        println!("\n[{}/{total}] {raw}", i + 1);
+
+        let Some(isbn13) = normalize_isbn(raw) else {
+            println!("  ⚠️  ISBN形式不正 — スキップ");
+            skip += 1;
+            continue;
+        };
+
+        let (page_id, props) = match find_duplicate_in_notion(&client, &isbn13, config).await {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                println!("  ⚠️  Notion に該当エントリなし (ISBN: {isbn13}) — スキップ");
+                skip += 1;
+                continue;
+            }
+            Err(e) => {
+                println!("  ❌ Notion 検索失敗: {e}");
+                fail += 1;
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                continue;
+            }
+        };
+
+        print_existing_entry(&props);
+
+        if dry_run {
+            println!("  🔍 ドライラン: 削除をスキップ（page_id: {page_id}）");
+            success += 1;
+            continue;
+        }
+
+        if !force && !prompt_delete() {
+            println!("  ⏭️  スキップ（削除キャンセル）");
+            skip += 1;
+            continue;
+        }
+
+        match archive_notion_page(&client, &page_id, config).await {
+            Ok(()) => {
+                println!("  ✅ 削除完了（Notion のゴミ箱から復元できます）");
+                success += 1;
+            }
+            Err(e) => {
+                println!("  ❌ Notion APIエラー: {e}");
+                fail += 1;
+            }
+        }
+        // Notion APIレートリミット対策（3 req/sec）
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    println!("\n{}", "=".repeat(60));
+    if dry_run {
+        println!(
+            "📊 結果（ドライラン）: 削除対象={success}  スキップ={skip}  失敗={fail}  合計={total}"
+        );
+    } else {
+        println!("📊 結果: 削除={success}  スキップ={skip}  失敗={fail}  合計={total}");
+    }
+}
 
 async fn process_isbns(
     isbn_list: Vec<String>,
@@ -457,10 +651,7 @@ async fn process_isbns(
     dry_run: bool,
     force: bool,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .expect("HTTPクライアントの初期化に失敗");
+    let client = build_http_client();
 
     let total = isbn_list.len();
     let (mut success, mut skip, mut fail) = (0usize, 0usize, 0usize);
@@ -481,10 +672,18 @@ async fn process_isbns(
             continue;
         };
 
-        let Some(book) = fetch_book(&client, &isbn13, config.tax_rate).await else {
-            println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
-            skip += 1;
-            continue;
+        let book = match fetch_book(&client, &isbn13, config.tax_rate).await {
+            Ok(Some(book)) => book,
+            Ok(None) => {
+                println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
+                skip += 1;
+                continue;
+            }
+            Err(e) => {
+                println!("  ❌ OpenBD取得エラー (ISBN: {isbn13}): {e:#}");
+                fail += 1;
+                continue;
+            }
         };
 
         println!("  📗 {}", book.title);
@@ -528,7 +727,15 @@ async fn process_isbns(
             let duplicate = if force {
                 None
             } else {
-                find_duplicate_in_notion(&client, &isbn13, config).await
+                match find_duplicate_in_notion(&client, &isbn13, config).await {
+                    Ok(found) => found,
+                    Err(e) => {
+                        println!("  ❌ 重複チェック失敗（登録を中止）: {e}");
+                        fail += 1;
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        continue;
+                    }
+                }
             };
 
             let result = match duplicate {
@@ -632,7 +839,8 @@ async fn main() {
         process::exit(0);
     }
 
-    let config = match Config::from_env(cli.dry_run) {
+    // 削除モードはドライランでも対象検索のため Notion に接続する
+    let config = match Config::from_env(!cli.dry_run || cli.delete) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
@@ -646,6 +854,20 @@ async fn main() {
             eprintln!("{e}");
             process::exit(1);
         }
+    }
+
+    if cli.delete {
+        println!("書籍DB登録ツール（削除モード）");
+        if cli.dry_run {
+            println!("   モード: ドライラン（対象の検索のみ行い、削除はしません）");
+        }
+        println!("   API Key: {}", mask_secret(&config.notion_api_key));
+        println!(
+            "   Database ID: {}",
+            mask_secret(&config.notion_database_id)
+        );
+        process_deletes(isbn_list, &config, cli.dry_run, cli.force).await;
+        return;
     }
 
     println!("書籍DB登録ツール");
@@ -720,9 +942,135 @@ mod tests {
         assert_eq!(extract_description(&onix), "紹介文");
     }
 
+    fn onix_prices(prices: Value) -> Value {
+        json!({ "ProductSupply": { "SupplyDetail": { "Price": prices } } })
+    }
+
+    #[test]
+    fn extract_price_prefers_fixed_price_excluding_tax() {
+        let onix = onix_prices(json!([
+            {"PriceType": "11", "CurrencyCode": "JPY", "PriceAmount": "980"},
+            {"PriceType": "03", "CurrencyCode": "JPY", "PriceAmount": "1500"},
+        ]));
+        assert_eq!(extract_price(&onix, 1.10), Some(1650));
+    }
+
+    #[test]
+    fn extract_price_uses_tax_included_price_as_is() {
+        let onix = onix_prices(json!({"PriceType": "04", "PriceAmount": "1650"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1650));
+    }
+
+    #[test]
+    fn extract_price_without_price_type_is_treated_as_excluding_tax() {
+        let onix = onix_prices(json!({"PriceAmount": "1000"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1100));
+    }
+
+    #[test]
+    fn extract_price_ignores_special_and_foreign_prices() {
+        let onix = onix_prices(json!([
+            {"PriceType": "11", "PriceAmount": "980"},
+            {"PriceType": "03", "CurrencyCode": "USD", "PriceAmount": "20"},
+        ]));
+        assert_eq!(extract_price(&onix, 1.10), None);
+    }
+
+    #[test]
+    fn extract_price_rounds_half_up() {
+        // 1234 * 1.10 = 1357.4 → 1357, 1235 * 1.10 = 1358.5 → 1359
+        let onix = onix_prices(json!({"PriceType": "03", "PriceAmount": "1234"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1357));
+        let onix = onix_prices(json!({"PriceType": "03", "PriceAmount": "1235"}));
+        assert_eq!(extract_price(&onix, 1.10), Some(1359));
+    }
+
+    #[test]
+    fn extract_price_returns_none_without_price() {
+        assert_eq!(extract_price(&json!({}), 1.10), None);
+    }
+
+    #[test]
+    fn duplicate_response_with_match_returns_page() {
+        let data = json!({
+            "object": "list",
+            "results": [{"id": "page-1", "properties": {"名前": {}}}]
+        });
+        let (id, props) = parse_duplicate_query_response(&data).unwrap().unwrap();
+        assert_eq!(id, "page-1");
+        assert!(props.get("名前").is_some());
+    }
+
+    #[test]
+    fn duplicate_response_without_match_returns_none() {
+        let data = json!({"object": "list", "results": []});
+        assert!(parse_duplicate_query_response(&data).unwrap().is_none());
+    }
+
+    #[test]
+    fn duplicate_response_error_is_err() {
+        let data = json!({
+            "object": "error",
+            "status": 429,
+            "code": "rate_limited",
+            "message": "Rate limited"
+        });
+        let err = parse_duplicate_query_response(&data).unwrap_err();
+        assert_eq!(err.to_string(), "Rate limited");
+    }
+
+    #[test]
+    fn duplicate_response_unexpected_shape_is_err() {
+        assert!(parse_duplicate_query_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn parse_openbd_response_null_entry_is_none() {
+        let data = json!([null]);
+        assert!(matches!(parse_openbd_response(&data, 1.1), Ok(None)));
+    }
+
+    #[test]
+    fn parse_openbd_response_returns_book() {
+        let data = json!([{
+            "summary": {"title": "テスト本", "isbn": "9784478039670", "pubdate": "20170101"},
+            "onix": {}
+        }]);
+        let book = parse_openbd_response(&data, 1.1).unwrap().unwrap();
+        assert_eq!(book.title, "テスト本");
+        assert_eq!(book.pubdate, "201701");
+    }
+
+    #[test]
+    fn parse_openbd_response_rejects_unexpected_format() {
+        assert!(parse_openbd_response(&json!({"error": "x"}), 1.1).is_err());
+        assert!(parse_openbd_response(&json!([]), 1.1).is_err());
+    }
+
     #[test]
     fn validate_purchase_date_accepts_real_date() {
         assert!(validate_purchase_date("2026-03-15").is_ok());
+    }
+
+    #[test]
+    fn archive_payload_sets_archived_true() {
+        assert_eq!(build_archive_payload(), json!({"archived": true}));
+    }
+
+    #[test]
+    fn cli_delete_conflicts_with_date() {
+        assert!(Cli::try_parse_from([
+            "book_register",
+            "--delete",
+            "-d",
+            "2026-03-15",
+            "9784478039670"
+        ])
+        .is_err());
+        let cli =
+            Cli::try_parse_from(["book_register", "--delete", "--force", "9784478039670"]).unwrap();
+        assert!(cli.delete && cli.force);
+        assert_eq!(cli.isbn, vec!["9784478039670"]);
     }
 
     #[test]
