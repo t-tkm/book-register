@@ -23,6 +23,8 @@ book_register --delete 9784478039670
 
 対応 ISBN 形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
 
+登録前に AmazonURL で重複をチェックし、既存エントリがあれば上書きするか確認します。重複チェックで Notion API がエラーを返した場合（レート制限・権限不足など）は登録せず「失敗」として数えます。
+
 ### 登録済みエントリの削除
 
 `--delete` を付けると、指定した ISBN のエントリを Notion から探し、内容を表示して `[y/N]` で確認した後にゴミ箱へ移動する。ゴミ箱からは Notion の GUI で復元できる。
@@ -33,7 +35,7 @@ book_register --delete --dry-run 9784478039670    # 削除対象を表示する�
 book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
 ```
 
-- 削除対象は `AmazonURL` プロパティ（ISBN から生成）で特定する。該当エントリがない ISBN はスキップとして集計する
+- 削除対象は `AmazonURL` プロパティ（ISBN から生成）で特定する。該当エントリがない ISBN はスキップ、検索で Notion API がエラーを返した ISBN は失敗として集計する
 - `--dry-run` でも対象を探すため Notion に接続する（`NOTION_API_KEY` / `NOTION_DATABASE_ID` が必要）
 - `--date` とは併用できない
 
