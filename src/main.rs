@@ -1,6 +1,6 @@
 use std::{path::Path, process, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::Parser;
 use regex::Regex;
@@ -210,14 +210,37 @@ fn isbn13_to_isbn10(isbn13: &str) -> Option<String> {
 // OpenBD
 // ============================================================
 
-async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Option<Book> {
+/// OpenBD から書誌情報を取得する。
+///
+/// - `Ok(Some(book))`: 取得成功
+/// - `Ok(None)`: OpenBD に該当データなし
+/// - `Err(_)`: 通信エラー・HTTP エラー・レスポンス解析失敗
+async fn fetch_book(client: &reqwest::Client, isbn13: &str, tax_rate: f64) -> Result<Option<Book>> {
     let url = format!("https://api.openbd.jp/v1/get?isbn={isbn13}");
-    let data: Value = client.get(&url).send().await.ok()?.json().await.ok()?;
-    let entry = data.get(0)?;
+    let data: Value = client
+        .get(&url)
+        .send()
+        .await
+        .context("通信に失敗")?
+        .error_for_status()
+        .context("HTTP エラー")?
+        .json()
+        .await
+        .context("レスポンスの JSON 解析に失敗")?;
+    parse_openbd_response(&data, tax_rate)
+}
+
+/// OpenBD のレスポンス（配列）を解釈する。該当なしは `null` 要素で返る。
+fn parse_openbd_response(data: &Value, tax_rate: f64) -> Result<Option<Book>> {
+    let entry = data
+        .as_array()
+        .context("想定外のレスポンス形式（配列ではない）")?
+        .first()
+        .context("想定外のレスポンス形式（空の配列）")?;
     if entry.is_null() {
-        return None;
+        return Ok(None);
     }
-    parse_openbd(entry, tax_rate)
+    Ok(parse_openbd(entry, tax_rate))
 }
 
 fn parse_openbd(data: &Value, tax_rate: f64) -> Option<Book> {
@@ -595,10 +618,18 @@ async fn process_isbns(
             continue;
         };
 
-        let Some(book) = fetch_book(&client, &isbn13, config.tax_rate).await else {
-            println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
-            skip += 1;
-            continue;
+        let book = match fetch_book(&client, &isbn13, config.tax_rate).await {
+            Ok(Some(book)) => book,
+            Ok(None) => {
+                println!("  ⚠️  OpenBDにデータなし (ISBN: {isbn13}) — スキップ");
+                skip += 1;
+                continue;
+            }
+            Err(e) => {
+                println!("  ❌ OpenBD取得エラー (ISBN: {isbn13}): {e:#}");
+                fail += 1;
+                continue;
+            }
         };
 
         println!("  📗 {}", book.title);
@@ -847,6 +878,29 @@ mod tests {
             "CollateralDetail": { "TextContent": {"Text": "<p>紹介<br/>文</p>"} }
         });
         assert_eq!(extract_description(&onix), "紹介文");
+    }
+
+    #[test]
+    fn parse_openbd_response_null_entry_is_none() {
+        let data = json!([null]);
+        assert!(matches!(parse_openbd_response(&data, 1.1), Ok(None)));
+    }
+
+    #[test]
+    fn parse_openbd_response_returns_book() {
+        let data = json!([{
+            "summary": {"title": "テスト本", "isbn": "9784478039670", "pubdate": "20170101"},
+            "onix": {}
+        }]);
+        let book = parse_openbd_response(&data, 1.1).unwrap().unwrap();
+        assert_eq!(book.title, "テスト本");
+        assert_eq!(book.pubdate, "201701");
+    }
+
+    #[test]
+    fn parse_openbd_response_rejects_unexpected_format() {
+        assert!(parse_openbd_response(&json!({"error": "x"}), 1.1).is_err());
+        assert!(parse_openbd_response(&json!([]), 1.1).is_err());
     }
 
     #[test]

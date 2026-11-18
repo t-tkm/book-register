@@ -156,6 +156,8 @@ ISBN 正規化
     ▼
 OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
   日本の書籍流通データベース（無料・登録不要）
+  ・該当データなし → スキップとして集計
+  ・通信エラー / HTTP エラー / JSON 解析失敗 → 失敗として集計
     │
     ▼
 Notion API  https://api.notion.com/v1/pages
