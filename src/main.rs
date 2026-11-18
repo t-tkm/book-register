@@ -23,7 +23,7 @@ struct Cli {
     #[arg(short, long)]
     file: Option<String>,
 
-    /// 購入年月日（YYYY-MM-DD、省略時は今日）
+    /// 購入年月日（YYYY-MM-DD、省略時は空で登録）
     #[arg(short, long, value_name = "YYYY-MM-DD")]
     date: Option<String>,
 
