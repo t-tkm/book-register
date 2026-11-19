@@ -178,7 +178,7 @@ Notion API  https://api.notion.com/v1/pages
 | Notion プロパティ | 型       | 取得元                                              |
 |----------------|---------|-----------------------------------------------------|
 | 名前            | タイトル  | `summary.title`                                     |
-| 代表著者        | テキスト  | `summary.author`                                    |
+| 代表著者        | テキスト  | `onix.DescriptiveDetail.Contributor` の先頭の著者1名（役割コード A01 を優先。無ければ `summary.author` の先頭）。生没年を除き、和名は「森 博嗣」、欧文名は「Yuval N. Harari」の形に整形 |
 | 出版月          | テキスト  | `summary.pubdate`（`YYYYMMDD` / `YYYYMM` → `YYYYMM` に変換）|
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合は Notion で手動入力） |
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUI で入力）|
