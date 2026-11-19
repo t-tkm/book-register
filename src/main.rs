@@ -10,8 +10,11 @@ use serde_json::{json, Map, Value};
 // CLI
 // ============================================================
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Parser)]
 #[command(
+    version,
     about = "ISBN → OpenBD → Notion 書籍DB登録",
     after_help = "例: book_register 9784478039670 9784798067278\n    book_register --delete 9784478039670"
 )]
@@ -1392,7 +1395,7 @@ async fn main() {
     if cli.backfill_isbn {
         // 埋め戻しはドライランでも Notion を読むため、認証情報を必須にする
         let config = load_config(true).await;
-        println!("書籍DB登録ツール（ISBN 埋め戻し）");
+        println!("書籍DB登録ツール v{VERSION}（ISBN 埋め戻し）");
         print_notion_target(&config);
         if let Err(e) = backfill_isbn(&config, cli.dry_run).await {
             eprintln!("❌ {e}");
@@ -1419,7 +1422,7 @@ async fn main() {
     }
 
     if cli.delete {
-        println!("書籍DB登録ツール（削除モード）");
+        println!("書籍DB登録ツール v{VERSION}（削除モード）");
         if cli.dry_run {
             println!("   モード: ドライラン（対象の検索のみ行い、削除はしません）");
         }
@@ -1428,7 +1431,7 @@ async fn main() {
         return;
     }
 
-    println!("書籍DB登録ツール");
+    println!("書籍DB登録ツール v{VERSION}");
     if cli.dry_run {
         println!("   モード: ドライラン（Notion API には接続しません）");
         if config.notion_api_key.is_empty() {
@@ -1756,6 +1759,15 @@ mod tests {
     #[test]
     fn archive_payload_sets_in_trash_true() {
         assert_eq!(build_archive_payload(), json!({"in_trash": true}));
+    }
+
+    #[test]
+    fn cli_version_flag_displays_version() {
+        for flag in ["--version", "-V"] {
+            let err = Cli::try_parse_from(["book_register", flag]).err().unwrap();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(err.to_string().contains(VERSION));
+        }
     }
 
     #[test]

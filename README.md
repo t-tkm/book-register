@@ -22,6 +22,9 @@ book_register --delete 9784478039670
 
 # 重複確認をスキップして強制登録
 book_register --force 9784478039670
+
+# バージョンを表示
+book_register --version
 ```
 
 対応 ISBN 形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
