@@ -461,6 +461,161 @@ fn notion_request(
         .header("Notion-Version", NOTION_VERSION)
 }
 
+/// リトライ方針を決めるための、リクエストの性質
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestKind {
+    /// 何度送っても結果が変わらない（GET・検索・同じ値での PATCH）
+    Idempotent,
+    /// 送るたびに新しいリソースができる（POST /v1/pages）
+    NonIdempotent,
+}
+
+/// 1 回の送信が失敗した理由
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendFailure {
+    /// HTTP ステータス（2xx 以外）
+    Status(u16),
+    /// 接続できなかった（リクエストはサーバーに届いていない）
+    Connect,
+    /// タイムアウト（サーバーが処理したかどうか分からない）
+    Timeout,
+}
+
+/// 最大リトライ回数（初回を含めず最大 3 回再送する）
+const MAX_RETRIES: u32 = 3;
+
+/// `Retry-After` を信用する上限（これより長い指定は上限で打ち切る）
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// 失敗のあとに再送するかを決める。再送するなら待ち時間を返す。
+///
+/// - 再送するのは 429 / 5xx / 通信エラーのみ。400・401・403・404 などは再送しても直らない
+/// - 429 で `Retry-After`（秒）があればそれに従い、なければ 1s → 2s → 4s の指数バックオフ
+/// - 非冪等（ページ作成）は、サーバーが処理していないと言い切れる 429 / 503 / 接続失敗だけ再送する。
+///   タイムアウトや 500 / 502 / 504 は、実は登録済みのことがあり、再送すると二重登録になりうる
+fn retry_delay(
+    kind: RequestKind,
+    failure: SendFailure,
+    retry_after: Option<&str>,
+    retries_done: u32,
+) -> Option<Duration> {
+    if retries_done >= MAX_RETRIES {
+        return None;
+    }
+    let retryable = match (kind, failure) {
+        (_, SendFailure::Status(429)) => true,
+        (_, SendFailure::Connect) => true,
+        (RequestKind::Idempotent, SendFailure::Status(code)) => (500..600).contains(&code),
+        (RequestKind::Idempotent, SendFailure::Timeout) => true,
+        (RequestKind::NonIdempotent, SendFailure::Status(503)) => true,
+        (RequestKind::NonIdempotent, _) => false,
+    };
+    if !retryable {
+        return None;
+    }
+    let backoff = Duration::from_secs(1 << retries_done);
+    if failure == SendFailure::Status(429) {
+        if let Some(secs) = retry_after.and_then(|v| v.trim().parse::<u64>().ok()) {
+            return Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER));
+        }
+    }
+    Some(backoff)
+}
+
+/// Notion API にリクエストを送り、応答 JSON を返す。
+///
+/// 一時的なエラー（429 / 5xx / 通信エラー）は `retry_delay` の方針で再送する。
+/// 最終的にエラー応答（`object: "error"`）だったときは、その `message` を Err にする。
+async fn send_notion(
+    client: &reqwest::Client,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&Value>,
+    kind: RequestKind,
+    config: &Config,
+) -> Result<Value> {
+    let mut retries_done = 0;
+    loop {
+        let mut request = notion_request(client, method.clone(), path, config);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let (failure, retry_after, outcome) = match request.send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status.is_success() || status.is_client_error() && status.as_u16() != 429 {
+                    // 成功、または再送しても直らないエラー: 応答本文をそのまま解釈する
+                    let data: Value = response.json().await.map_err(|e| {
+                        anyhow::anyhow!("応答の JSON 解析に失敗（HTTP {status}）: {e}")
+                    })?;
+                    if let Some(msg) = notion_error(&data) {
+                        anyhow::bail!("{msg}");
+                    }
+                    return Ok(data);
+                }
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let data: Option<Value> = response.json().await.ok();
+                let msg = data
+                    .as_ref()
+                    .and_then(notion_error)
+                    .unwrap_or_else(|| format!("HTTP {status}"));
+                (SendFailure::Status(status.as_u16()), retry_after, msg)
+            }
+            Err(e) => {
+                let failure = if e.is_connect() {
+                    SendFailure::Connect
+                } else if e.is_timeout() {
+                    SendFailure::Timeout
+                } else {
+                    // 送信途中の切断など、届いたかどうか分からないエラーは再送しない
+                    anyhow::bail!("Notion API への通信に失敗: {e}");
+                };
+                (failure, None, format!("Notion API への通信に失敗: {e}"))
+            }
+        };
+
+        let Some(wait) = retry_delay(kind, failure, retry_after.as_deref(), retries_done) else {
+            let mut msg = outcome;
+            if retries_done > 0 {
+                msg.push_str(&format!("（{retries_done} 回再試行しても失敗）"));
+            }
+            if may_have_been_processed(kind, failure) {
+                msg.push_str(" — 登録されている可能性があります。Notion で確認してください");
+            }
+            anyhow::bail!("{msg}");
+        };
+        retries_done += 1;
+        println!(
+            "  ⏳ Notion API が一時的に失敗（{}）— {} 秒後に再試行します（{retries_done}/{MAX_RETRIES}）",
+            describe_failure(failure),
+            wait.as_secs_f32()
+        );
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// 非冪等なリクエストが、サーバー側では処理済みかもしれない失敗か
+fn may_have_been_processed(kind: RequestKind, failure: SendFailure) -> bool {
+    kind == RequestKind::NonIdempotent
+        && match failure {
+            SendFailure::Timeout => true,
+            SendFailure::Status(code) => (500..600).contains(&code) && code != 503,
+            SendFailure::Connect => false,
+        }
+}
+
+fn describe_failure(failure: SendFailure) -> String {
+    match failure {
+        SendFailure::Status(code) => format!("HTTP {code}"),
+        SendFailure::Connect => "接続失敗".to_string(),
+        SendFailure::Timeout => "タイムアウト".to_string(),
+    }
+}
+
 fn notion_error(response: &Value) -> Option<String> {
     (response["object"].as_str() == Some("error")).then(|| {
         response["message"]
@@ -509,21 +664,16 @@ async fn resolve_data_source_id(
     if !config.notion_data_source_id.is_empty() {
         return Ok(config.notion_data_source_id.clone());
     }
-    let database: Value = notion_request(
+    let database = send_notion(
         client,
         reqwest::Method::GET,
         &format!("/databases/{}", config.notion_database_id),
+        None,
+        RequestKind::Idempotent,
         config,
     )
-    .send()
     .await
-    .map_err(|e| format!("❌ Notion API に接続できません: {e}"))?
-    .json()
-    .await
-    .map_err(|e| format!("❌ Notion API の応答を解釈できません: {e}"))?;
-    if let Some(msg) = notion_error(&database) {
-        return Err(format!("❌ データベース情報の取得に失敗しました: {msg}"));
-    }
+    .map_err(|e| format!("❌ データベース情報の取得に失敗しました: {e:#}"))?;
     select_data_source_id(&database)
 }
 
@@ -598,19 +748,15 @@ fn build_notion_payload(
 /// data source に ISBN（テキスト）プロパティがあるかを確認する。
 /// 2025-09-03 以降、プロパティのスキーマは database ではなく data source 側にある
 async fn database_has_isbn_property(client: &reqwest::Client, config: &Config) -> Result<bool> {
-    let data: Value = notion_request(
+    let data = send_notion(
         client,
         reqwest::Method::GET,
         &format!("/data_sources/{}", config.notion_data_source_id),
+        None,
+        RequestKind::Idempotent,
         config,
     )
-    .send()
-    .await?
-    .json()
     .await?;
-    if let Some(msg) = notion_error(&data) {
-        anyhow::bail!("{msg}");
-    }
     Ok(data["properties"][ISBN_PROPERTY]["type"].as_str() == Some("rich_text"))
 }
 
@@ -646,21 +792,16 @@ async fn query_data_source(
     if let Some(cursor) = start_cursor {
         query["start_cursor"] = json!(cursor);
     }
-    let data: Value = notion_request(
+    // 検索は POST だが読み取りのみなので、何度送っても安全
+    send_notion(
         client,
         reqwest::Method::POST,
         &format!("/data_sources/{}/query", config.notion_data_source_id),
+        Some(&query),
+        RequestKind::Idempotent,
         config,
     )
-    .json(&query)
-    .send()
-    .await?
-    .json()
-    .await?;
-    if let Some(msg) = notion_error(&data) {
-        anyhow::bail!("{msg}");
-    }
-    Ok(data)
+    .await
 }
 
 async fn find_duplicate_in_notion(
@@ -748,16 +889,16 @@ fn prompt_yes_no(message: &str) -> bool {
 }
 
 async fn insert_to_notion(client: &reqwest::Client, payload: Value, config: &Config) -> Result<()> {
-    let response: Value = notion_request(client, reqwest::Method::POST, "/pages", config)
-        .json(&payload)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(msg) = notion_error(&response) {
-        anyhow::bail!("{msg}");
-    }
+    // 再送すると二重登録になりうるため、処理されていないことが確実な失敗だけ再送する
+    send_notion(
+        client,
+        reqwest::Method::POST,
+        "/pages",
+        Some(&payload),
+        RequestKind::NonIdempotent,
+        config,
+    )
+    .await?;
     Ok(())
 }
 
@@ -769,21 +910,16 @@ async fn update_notion_page(
 ) -> Result<()> {
     let properties = payload["properties"].clone();
     let body = json!({ "properties": properties });
-    let response: Value = notion_request(
+    // 同じ値で上書きするだけなので、何度送っても結果は変わらない
+    send_notion(
         client,
         reqwest::Method::PATCH,
         &format!("/pages/{page_id}"),
+        Some(&body),
+        RequestKind::Idempotent,
         config,
     )
-    .json(&body)
-    .send()
-    .await?
-    .json()
     .await?;
-
-    if let Some(msg) = notion_error(&response) {
-        anyhow::bail!("{msg}");
-    }
     Ok(())
 }
 
@@ -792,21 +928,16 @@ async fn archive_notion_page(
     page_id: &str,
     config: &Config,
 ) -> Result<()> {
-    let response: Value = notion_request(
+    // ゴミ箱へ移動済みのページに再度送っても状態は変わらない
+    send_notion(
         client,
         reqwest::Method::PATCH,
         &format!("/pages/{page_id}"),
+        Some(&build_archive_payload()),
+        RequestKind::Idempotent,
         config,
     )
-    .json(&build_archive_payload())
-    .send()
-    .await?
-    .json()
     .await?;
-
-    if let Some(msg) = notion_error(&response) {
-        anyhow::bail!("{msg}");
-    }
     Ok(())
 }
 
@@ -1329,6 +1460,97 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- retry_delay ----------
+
+    const IDEM: RequestKind = RequestKind::Idempotent;
+    const NON_IDEM: RequestKind = RequestKind::NonIdempotent;
+
+    fn secs(n: u64) -> Option<Duration> {
+        Some(Duration::from_secs(n))
+    }
+
+    #[test]
+    fn retry_delay_backs_off_exponentially() {
+        let f = SendFailure::Status(500);
+        assert_eq!(retry_delay(IDEM, f, None, 0), secs(1));
+        assert_eq!(retry_delay(IDEM, f, None, 1), secs(2));
+        assert_eq!(retry_delay(IDEM, f, None, 2), secs(4));
+    }
+
+    #[test]
+    fn retry_delay_gives_up_after_max_retries() {
+        assert_eq!(retry_delay(IDEM, SendFailure::Status(429), None, 3), None);
+        assert_eq!(retry_delay(IDEM, SendFailure::Timeout, None, 3), None);
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_on_429() {
+        let f = SendFailure::Status(429);
+        assert_eq!(retry_delay(IDEM, f, Some("5"), 0), secs(5));
+        assert_eq!(retry_delay(NON_IDEM, f, Some(" 2 "), 1), secs(2));
+        // 上限で打ち切る
+        assert_eq!(retry_delay(IDEM, f, Some("3600"), 0), secs(60));
+        // 解釈できない値は指数バックオフ
+        assert_eq!(retry_delay(IDEM, f, Some("soon"), 1), secs(2));
+        assert_eq!(retry_delay(IDEM, f, None, 2), secs(4));
+    }
+
+    #[test]
+    fn retry_delay_ignores_retry_after_except_429() {
+        assert_eq!(
+            retry_delay(IDEM, SendFailure::Status(503), Some("30"), 0),
+            secs(1)
+        );
+    }
+
+    #[test]
+    fn retry_delay_does_not_retry_client_errors() {
+        for code in [400, 401, 403, 404, 409, 422] {
+            assert_eq!(retry_delay(IDEM, SendFailure::Status(code), None, 0), None);
+            assert_eq!(
+                retry_delay(NON_IDEM, SendFailure::Status(code), None, 0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_idempotent_retries_5xx_and_network_errors() {
+        for code in [500, 502, 503, 504] {
+            assert!(retry_delay(IDEM, SendFailure::Status(code), None, 0).is_some());
+        }
+        assert!(retry_delay(IDEM, SendFailure::Connect, None, 0).is_some());
+        assert!(retry_delay(IDEM, SendFailure::Timeout, None, 0).is_some());
+    }
+
+    #[test]
+    fn retry_delay_non_idempotent_retries_only_unprocessed_failures() {
+        // 処理されていないことが確実な失敗だけ再送する
+        assert!(retry_delay(NON_IDEM, SendFailure::Status(429), None, 0).is_some());
+        assert!(retry_delay(NON_IDEM, SendFailure::Status(503), None, 0).is_some());
+        assert!(retry_delay(NON_IDEM, SendFailure::Connect, None, 0).is_some());
+        // 登録済みかもしれない失敗は再送しない（二重登録の防止）
+        for code in [500, 502, 504] {
+            assert_eq!(
+                retry_delay(NON_IDEM, SendFailure::Status(code), None, 0),
+                None
+            );
+        }
+        assert_eq!(retry_delay(NON_IDEM, SendFailure::Timeout, None, 0), None);
+    }
+
+    #[test]
+    fn may_have_been_processed_only_for_ambiguous_create_failures() {
+        assert!(may_have_been_processed(NON_IDEM, SendFailure::Timeout));
+        assert!(may_have_been_processed(NON_IDEM, SendFailure::Status(500)));
+        assert!(may_have_been_processed(NON_IDEM, SendFailure::Status(504)));
+        assert!(!may_have_been_processed(NON_IDEM, SendFailure::Status(503)));
+        assert!(!may_have_been_processed(NON_IDEM, SendFailure::Status(429)));
+        assert!(!may_have_been_processed(NON_IDEM, SendFailure::Status(400)));
+        assert!(!may_have_been_processed(NON_IDEM, SendFailure::Connect));
+        assert!(!may_have_been_processed(IDEM, SendFailure::Timeout));
+    }
 
     #[test]
     fn normalize_isbn13_digits_only() {
