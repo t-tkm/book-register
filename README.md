@@ -19,11 +19,14 @@ book_register --dry-run 9784478039670
 
 # 登録済みエントリを削除（Notion のゴミ箱へ移動）
 book_register --delete 9784478039670
+
+# 重複確認をスキップして強制登録
+book_register --force 9784478039670
 ```
 
 対応 ISBN 形式: ISBN-13（ハイフン有無）・ISBN-10（ハイフン有無・X チェックディジット）
 
-登録前に AmazonURL で重複をチェックし、既存エントリがあれば上書きするか確認します。重複チェックで Notion API がエラーを返した場合（レート制限・権限不足など）は登録せず「失敗」として数えます。
+登録前に重複をチェックし、既存エントリがあれば上書きするか確認します（判定条件は「[重複判定](#重複判定)」を参照）。重複チェックで Notion API がエラーを返した場合（レート制限・権限不足など）は登録せず「失敗」として数えます。
 
 ### 登録済みエントリの削除
 
@@ -35,7 +38,7 @@ book_register --delete --dry-run 9784478039670    # 削除対象を表示する�
 book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
 ```
 
-- 削除対象は `AmazonURL` プロパティ（ISBN から生成）で特定する。該当エントリがない ISBN はスキップ、検索で Notion API がエラーを返した ISBN は失敗として集計する
+- 削除対象は登録時の重複判定と同じ条件（`ISBN` 列、または ISBN から生成した `AmazonURL`）で特定する。該当エントリがない ISBN はスキップ、検索で Notion API がエラーを返した ISBN は失敗として集計する
 - `--dry-run` でも対象を探すため Notion に接続する（`NOTION_API_KEY` / `NOTION_DATABASE_ID` が必要）
 - `--date` とは併用できない
 
@@ -64,10 +67,38 @@ book_register --delete --force -f isbn_list.txt   # 確認なしで一括削除
 | ジャンル    | セレクト  | — |
 | 概要        | テキスト  | ✅ |
 | 出版月      | テキスト  | ✅ |
+| ISBN        | テキスト  | ✅（推奨。重複判定に使用） |
 | AmazonURL  | URL      | ✅ |
 | 購入年月    | 日付     | ✅（`--date` 指定時。省略時は空） |
 | メモ        | テキスト  | — |
 | ステータス  | ステータス | — |
+
+#### 重複判定
+
+登録前に、同じ書籍が DB にあるかを確認し、あれば既存エントリを表示して上書きするか尋ねる（`--force` でスキップ）。判定条件は次のとおり。
+
+| DB の `ISBN` 列 | 判定条件 |
+|----------------|---------|
+| あり | `ISBN` が ISBN-13 と一致 **または** `AmazonURL` が一致（列追加前のエントリとの互換） |
+| なし | `AmazonURL` が一致（978 始まりのみ。979 始まりは判定できない） |
+
+`ISBN` 列がない DB でも動作するが、979 始まりの ISBN は重複を検出できないため、`ISBN`（テキスト）列の追加を推奨する。
+
+検索で Notion API がエラーを返した ISBN は登録せず「失敗」として集計する。起動時の DB スキーマ取得（`ISBN` 列の有無の確認）に失敗した場合は、正しく判定できないため処理全体を中止する。
+
+#### 既存エントリへの ISBN 埋め戻し
+
+`ISBN` 列を後から追加した場合、既存エントリの `AmazonURL`（`/dp/{ISBN-10}/`）から ISBN-13 を復元して書き込める。対象は「`ISBN` が空で `AmazonURL` があるエントリ」。
+
+```sh
+# 対象一覧の確認（Notion は読むだけで更新しない）
+book_register --backfill-isbn --dry-run
+
+# 埋め戻しを実行
+book_register --backfill-isbn
+```
+
+> 979 始まりの書籍は AmazonURL が作られないため埋め戻し対象外。必要なら Notion 上で手入力するか、`--force` なしで再登録して上書きする。
 
 データベース ID はブラウザで開いたときの URL `https://www.notion.so/<ID>?v=...` の `<ID>` 部分（32文字）。
 
@@ -167,11 +198,13 @@ OpenBD API  https://api.openbd.jp/v1/get?isbn={ISBN-13}
   ・通信エラー / HTTP エラー / JSON 解析失敗 → 失敗として集計
     │
     ▼
-Notion API  https://api.notion.com/v1/pages
-  取得した書誌情報をページとして挿入
+Notion API
+  /v1/databases/{id}        ISBN 列の有無を確認（起動時 1 回）
+  /v1/databases/{id}/query  ISBN / AmazonURL で重複確認
+  /v1/pages                 新規登録（重複時は確認のうえ既存ページを更新）
 ```
 
-`--delete` 時は OpenBD を使わず、`POST /v1/databases/{id}/query`（AmazonURL で検索）→ `PATCH /v1/pages/{page_id}`（`{"archived": true}`）でゴミ箱へ移動する。
+`--delete` 時は OpenBD を使わず、`POST /v1/databases/{id}/query`（重複判定と同じ条件で検索）→ `PATCH /v1/pages/{page_id}`（`{"archived": true}`）でゴミ箱へ移動する。
 
 ### フィールドマッピング
 
@@ -183,6 +216,7 @@ Notion API  https://api.notion.com/v1/pages
 | 概要            | テキスト  | `onix.CollateralDetail.TextContent`（データがあれば取得、空の場合は Notion で手動入力） |
 | 購入年月        | 日付     | `--date` オプションで指定（省略時は空。Notion GUI で入力）|
 | 価格            | 数値     | `onix.ProductSupply.SupplyDetail.Price[]` から税込価格を算出（下記「価格の決め方」参照） |
+| ISBN           | テキスト  | `summary.isbn`（ISBN-13。DB に `ISBN` テキスト列がある場合のみ） |
 | AmazonURL      | URL      | ISBN-13 → ISBN-10 変換後、`https://www.amazon.co.jp/dp/{ISBN-10}/` を生成 |
 | 画像            | ファイル&メディア | `summary.cover`（外部 URL として添付）                |
 
